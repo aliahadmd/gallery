@@ -274,6 +274,20 @@ public final class MediaLibraryModel {
         duplicateBests.contains(item.id)
     }
 
+    /// The picture a sidebar row shows beside its name. Served from the grid poster that pass B already baked,
+    /// so a shelf full of covers costs a disk read each rather than a decode of every original.
+    public func coverPreview(for album: Album) async -> CGImage? {
+        guard let id = album.coverMediaID else { return nil }
+        let item: MediaItem?
+        if let shown = items.first(where: { $0.id == id }) {
+            item = shown
+        } else {
+            item = try? await reader.item(id: id)
+        }
+        guard let item else { return nil }
+        return await thumbnails.image(.init(item: item), bucket: .gridLarge)
+    }
+
     /// Pause/resume the third pass. The worker publishes a snapshot when it changes, so the HUD follows
     /// without this method having to guess.
     public func setAnalysisPaused(_ paused: Bool) async {

@@ -42,7 +42,7 @@ public struct SidebarView: View {
                     // One level of folder albums, indented under the folder they belong to. Deeper nesting
                     // is a file manager's job, not a gallery's.
                     ForEach(model.subfolders[source.id] ?? []) { album in
-                        dateRow(album, symbol: "folder")
+                        dateRow(album, symbol: "folder", cover: true)
                             .padding(.leading, 14)
                     }
                 }
@@ -79,7 +79,7 @@ public struct SidebarView: View {
             if !model.places.isEmpty {
                 Section("Places") {
                     ForEach(model.places) { album in
-                        dateRow(album, symbol: "mappin.and.ellipse")
+                        dateRow(album, symbol: "mappin.and.ellipse", cover: true)
                     }
                 }
             }
@@ -89,7 +89,7 @@ public struct SidebarView: View {
             if !model.tags.isEmpty {
                 Section("Tags") {
                     ForEach(model.tags) { album in
-                        dateRow(album, symbol: tagSymbol(album))
+                        dateRow(album, symbol: tagSymbol(album), cover: true)
                     }
                 }
             }
@@ -103,7 +103,7 @@ public struct SidebarView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(model.people) { album in
-                        dateRow(album, symbol: "person.crop.circle")
+                        dateRow(album, symbol: "person.crop.circle", cover: true)
                             .contextMenu {
                                 Button("Name Person…") {
                                     renamingPerson = album
@@ -160,8 +160,9 @@ public struct SidebarView: View {
     }
 
     /// A date album: its count is the catalog's own, so "the sidebar says 12 and the grid shows 12" is true by
-    /// construction rather than by two queries that happen to agree.
-    private func dateRow(_ album: Album, symbol: String) -> some View {
+    /// construction rather than by two queries that happen to agree. Shelves pass `cover: true` to show the
+    /// album's best-scoring picture instead of a generic symbol.
+    private func dateRow(_ album: Album, symbol: String, cover: Bool = false) -> some View {
         Label {
             HStack(spacing: 6) {
                 Text(album.title).lineLimit(1)
@@ -172,8 +173,12 @@ public struct SidebarView: View {
                     .foregroundStyle(.secondary)
             }
         } icon: {
-            Image(systemName: symbol)
-                .foregroundStyle(.secondary)
+            if cover, album.coverMediaID != nil {
+                CoverThumb(album: album, model: model)
+            } else {
+                Image(systemName: symbol)
+                    .foregroundStyle(.secondary)
+            }
         }
         .tag(album.kind)
     }
@@ -266,6 +271,30 @@ extension IndexPhase {
         switch self {
         case .finished, .failed: false
         default: true
+        }
+    }
+}
+
+/// A shelf row's picture: the album's best-scoring member, from the poster pass B already baked.
+private struct CoverThumb: View {
+    let album: Album
+    let model: MediaLibraryModel
+    @State private var image: CGImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Color.primary.opacity(0.07)
+            }
+        }
+        .frame(width: 18, height: 18)
+        .clipShape(RoundedRectangle(cornerRadius: 3))
+        .task(id: album.coverMediaID) {
+            image = await model.coverPreview(for: album)
         }
     }
 }

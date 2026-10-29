@@ -27,6 +27,8 @@ public actor AnalysisWorker {
         public var faces: FaceClusterer.Configuration
         public var duplicates: DuplicateFinder.Configuration
         public var pausedPollInterval: Duration
+        /// Yield while the Mac asks for less work: Low Power Mode, or a thermal state the kernel calls serious.
+        public var pauseUnderPressure: Bool
 
         public init(batchRows: Int = 32, maximumAttempts: Int = 2,
                     visionLane: BlockingLane = BlockingLane(label: "app.gallery.vision",
@@ -35,7 +37,8 @@ public actor AnalysisWorker {
                     analyzer: VisionAnalyzer.Configuration = .init(),
                     faces: FaceClusterer.Configuration = .init(),
                     duplicates: DuplicateFinder.Configuration = .init(),
-                    pausedPollInterval: Duration = .milliseconds(500)) {
+                    pausedPollInterval: Duration = .milliseconds(500),
+                    pauseUnderPressure: Bool = true) {
             self.batchRows = max(1, batchRows)
             self.maximumAttempts = max(1, maximumAttempts)
             self.visionLane = visionLane
@@ -44,6 +47,7 @@ public actor AnalysisWorker {
             self.faces = faces
             self.duplicates = duplicates
             self.pausedPollInterval = pausedPollInterval
+            self.pauseUnderPressure = pauseUnderPressure
         }
     }
 
@@ -105,7 +109,7 @@ public actor AnalysisWorker {
         task = Task(priority: .utility) {
             try? await catalog.beginAnalysisSession()
             let outcome = await self.drainGuarded()
-            Log.indexing.info("analysis: \(outcome.analyzed) analysed, \(outcome.tagged) tagged, \(outcome.textFound) with text, \(outcome.facesFound) faces, \(outcome.failed) failed, \(outcome.parked) parked")
+            Log.analysis.info("analysis: \(outcome.analyzed) analysed, \(outcome.tagged) tagged, \(outcome.textFound) with text, \(outcome.facesFound) faces, \(outcome.duplicatesLinked) duplicates")
             self.task = nil
         }
     }
@@ -144,6 +148,11 @@ public actor AnalysisWorker {
         var outcome = Outcome()
         while !Task.isCancelled {
             await waitWhilePaused()
+            if underPressure() {
+                // The cheapest way to be a good citizen: do nothing, and look again in a couple of seconds.
+                try? await Task.sleep(for: .seconds(2))
+                continue
+            }
             if let gate = configuration.gate, await gate() {
                 // Pass B owns the machine while it runs; analysis resumes when it reports finished.
                 try? await Task.sleep(for: configuration.pausedPollInterval)
@@ -163,6 +172,14 @@ public actor AnalysisWorker {
         while isPaused, !Task.isCancelled {
             try? await Task.sleep(for: configuration.pausedPollInterval)
         }
+    }
+
+    /// The system saying "not now": Low Power Mode, or a thermal state the kernel calls serious.
+    private func underPressure() -> Bool {
+        guard configuration.pauseUnderPressure else { return false }
+        let info = ProcessInfo.processInfo
+        return info.isLowPowerModeEnabled
+            || info.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
     }
 
     private func process(_ jobs: [AnalysisJob], into outcome: inout Outcome) async {
