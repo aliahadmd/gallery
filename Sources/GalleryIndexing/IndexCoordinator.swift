@@ -100,14 +100,17 @@ public actor IndexCoordinator {
     private let sweeper = Sweeper()
 
     private var jobs: [SourceID: Job] = [:]
+    private let selfWrites: SelfWriteGuard
     private var listeners: [UUID: AsyncStream<IndexProgress>.Continuation] = [:]
 
     public init(catalog: Catalog, reader: CatalogReader, bookmarks: BookmarkStore = BookmarkStore(),
-                configuration: Configuration = Configuration()) {
+                configuration: Configuration = Configuration(),
+                selfWrites: SelfWriteGuard = SelfWriteGuard()) {
         self.catalog = catalog
         self.reader = reader
         self.bookmarks = bookmarks
         self.configuration = configuration
+        self.selfWrites = selfWrites
     }
 
     // MARK: - Sources
@@ -253,6 +256,8 @@ public actor IndexCoordinator {
     /// One rescan per burst. A scan already running makes `startScan` refuse, which is exactly right: the
     /// walk in flight will see the new files, and a second one would only race it.
     private func observedChange(_ sourceID: SourceID) {
+        // Our own in-place edit fires FSEvents too. Walking the folder for it would be a rescan per edit.
+        guard !selfWrites.shouldIgnore() else { return }
         watchDebounce[sourceID]?.cancel()
         watchDebounce[sourceID] = Task { [weak self] in
             guard let self else { return }

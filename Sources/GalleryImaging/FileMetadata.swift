@@ -59,6 +59,9 @@ public struct FileMetadata: Sendable, Hashable {
     public var codec: String?
     public var isRaw: Bool
     public var dates: ExifDates
+    /// IPTC `ObjectName`, trimmed; nil when the file carries no title. Not defaulted to the filename — the
+    /// catalog stores what the file says, and the UI falls back to the name when it is nil.
+    public var title: String?
 
     public init(
         typeIdentifier: String? = nil,
@@ -73,7 +76,8 @@ public struct FileMetadata: Sendable, Hashable {
         durationMicroseconds: Int64? = nil,
         codec: String? = nil,
         isRaw: Bool = false,
-        dates: ExifDates = .none
+        dates: ExifDates = .none,
+        title: String? = nil
     ) {
         self.typeIdentifier = typeIdentifier
         self.pixelSize = pixelSize
@@ -88,6 +92,7 @@ public struct FileMetadata: Sendable, Hashable {
         self.codec = codec
         self.isRaw = isRaw
         self.dates = dates
+        self.title = title
     }
 
     public static let empty = FileMetadata()

@@ -35,6 +35,10 @@ enum MetadataRules {
         item.subtype = refinedSubtype(of: row, metadata)
         item.searchText = searchText(kind: item.kind, subtype: item.subtype, codec: item.codec,
                                      colorSpace: item.colorSpace)
+        // Deliberate exception to the `?? row` rule every other field follows: the title is authored by us
+        // and written into the file, so the file is the whole truth. A fallback to the row's old value would
+        // make a cleared title impossible to represent for the rest of the file's life.
+        item.title = metadata.title
         return item
     }
 

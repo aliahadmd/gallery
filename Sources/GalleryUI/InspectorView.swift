@@ -12,6 +12,7 @@ public struct InspectorView: View {
     private let model: MediaLibraryModel
 
     @State private var preview: CGImage?
+    @State private var backupDate: Date?
 
     public init(model: MediaLibraryModel) {
         self.model = model
@@ -28,6 +29,13 @@ public struct InspectorView: View {
             }
         }
         .frame(minWidth: 240, idealWidth: 280)
+        .task(id: model.selectedID) {
+            guard let id = model.selectedID else {
+                backupDate = nil
+                return
+            }
+            backupDate = await model.previousVersion(for: id)
+        }
     }
 
     private func details(_ item: MediaItem) -> some View {
@@ -35,11 +43,20 @@ public struct InspectorView: View {
             previewImage(item)
 
             HStack(alignment: .firstTextBaseline) {
-                Text(item.name)
-                    .font(.headline)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title ?? item.name)
+                        .font(.headline)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                    if item.title != nil {
+                        Text(item.name)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
                 Spacer(minLength: 8)
                 Button { Task { await model.toggleFavorite(item.id) } } label: {
                     Image(systemName: item.isFavorite ? "star.fill" : "star")
@@ -53,6 +70,21 @@ public struct InspectorView: View {
                 Text(captured.formatted(date: .long, time: .standard))
                     .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+
+            if let backupDate {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Previous version available", systemImage: "clock.arrow.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(backupDate.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Button("Revert to Previous Version") {
+                        Task { await model.revertToPreviousVersion(item) }
+                    }
+                    .controlSize(.small)
+                }
             }
 
             if item.error != .none {

@@ -80,8 +80,12 @@ enum MediaStatements {
       cap_utc = ?, cap_wall = ?, cap_day = ?, cap_month = ?, cap_tz = ?, cap_src = ?,
       lat = ?, lon = ?, has_gps = ?, place_key = ?, cluster_id = ?,
       device = ?, lens = ?, meta_json = COALESCE(?, meta_json), search_text = ?,
-      subtype = ?, kind = ?, stage = ?, err_code = ?
-    WHERE id = ?
+      subtype = ?, kind = ?, stage = ?, err_code = ?,
+      -- The title is written without a COALESCE: it is authored by the user, and a title cleared in the
+      -- editor must be able to stay cleared. The CAS makes a stale hop harmless — a hop that decoded the
+      -- bytes before an edit lands on zero rows and is re-queued instead of overwriting the edit.
+      title = ?
+    WHERE id = ? AND stat_hash = ?
     """
 
     /// A rename lands as an update of `rel_path` on the doc-matched row. If another row already claims the
@@ -155,7 +159,9 @@ enum MediaStatements {
             .integer(Int64(item.kind.rawValue)),
             .integer(Int64(item.stage.rawValue)),
             .integer(Int64(item.error.rawValue)),
+            item.title.map(Value.text) ?? .null,
             .integer(item.id.rawValue),
+            .integer(Int64(bitPattern: item.identity.statHash)),
         ]
     }
 }

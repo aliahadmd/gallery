@@ -280,9 +280,9 @@ public actor CatalogReader {
         // so the column carrying a marker is the column the user's words actually hit. A filename with a
         // literal bracket in it costs a preference, never a wrong row.
         //
-        // Weights are positional since v3: name 10, place 5, device 3, lens 2, search_text 1, tags 4,
-        // OCR 2. A tag is a curated judgement; OCR is a transcription that contains "ok" and "cancel" on
-        // every screenshot, so it sits above the file's own vocabulary but well below a name.
+        // Weights are positional: name 10, place 5, device 3, lens 2, search_text 1, tags 4, OCR 2,
+        // title 12. A title is the one column a human wrote on purpose; a filename is usually a camera
+        // serial, so the title sits above it. Appending the column keeps every earlier index unchanged.
         let rows = try handle.query(
             """
             SELECT \(CatalogRow.itemSelectList),
@@ -290,7 +290,8 @@ public actor CatalogReader {
                    snippet(media_fts, 4, '[', ']', '…', 12) AS body_hit,
                    snippet(media_fts, 5, '[', ']', '…', 12) AS tag_hit,
                    snippet(media_fts, 6, '[', ']', '…', 12) AS text_hit,
-                   bm25(media_fts, 10.0, 5.0, 3.0, 2.0, 1.0, 4.0, 2.0) AS rank
+                   snippet(media_fts, 7, '[', ']', '…', 12) AS title_hit,
+                   bm25(media_fts, 10.0, 5.0, 3.0, 2.0, 1.0, 4.0, 2.0, 12.0) AS rank
             FROM media_fts
             JOIN media ON media.id = media_fts.rowid
             LEFT JOIN favorite ON favorite.media_id = media.id
@@ -305,10 +306,12 @@ public actor CatalogReader {
             let bodyHit = try row.optionalString(named: "body_hit") ?? ""
             let tagHit = try row.optionalString(named: "tag_hit") ?? ""
             let textHit = try row.optionalString(named: "text_hit") ?? ""
-            // Name first (the strongest evidence), then the recognised text, then the tag, then the file's
-            // own vocabulary. The first column carrying a marker is the one that actually matched.
+            let titleHit = try row.optionalString(named: "title_hit") ?? ""
+            // Title first (the words a person chose), then the name, then the recognised text, then the
+            // tag, then the file's own vocabulary. The first column carrying a marker is the one that hit.
             let candidates: [(SearchColumn, String)] = [
-                (.name, nameHit), (.recognizedText, textHit), (.tag, tagHit), (.body, bodyHit),
+                (.title, titleHit), (.name, nameHit), (.recognizedText, textHit), (.tag, tagHit),
+                (.body, bodyHit),
             ]
             let hit = candidates.first { $0.1.contains("[") }
             return SearchHit(
@@ -344,6 +347,7 @@ public actor CatalogReader {
 /// Which column the query actually hit. A screenshot that matched on its recognised text and not its
 /// filename is confusing without it — the row "IMG_4821.jpg" would otherwise look like a false positive.
 public enum SearchColumn: String, Sendable, Hashable, Codable {
+    case title
     case name
     case recognizedText
     case tag

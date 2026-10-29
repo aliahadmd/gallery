@@ -4,6 +4,7 @@ import Observation
 import GalleryAnalysis
 import GalleryDomain
 import GalleryCatalog
+import GalleryEditing
 import GalleryIndexing
 
 /// Something the user should be told about, once, in the UI rather than only in the log.
@@ -15,6 +16,16 @@ public struct Notice: Identifiable, Sendable, Hashable {
     public init(_ text: String, detail: String? = nil) {
         self.text = text
         self.detail = detail
+    }
+}
+
+/// Panels the library cannot host itself: the App target owns `NSOpenPanel`, and the grid and the cells only
+/// need to know that asking for one is a thing that can happen.
+public struct MediaLibraryActions: Sendable {
+    public var exportCopies: @MainActor @Sendable ([MediaID]) async -> Void
+
+    public init(exportCopies: @escaping @MainActor @Sendable ([MediaID]) async -> Void) {
+        self.exportCopies = exportCopies
     }
 }
 
@@ -50,6 +61,14 @@ public final class MediaLibraryModel {
     public private(set) var selectedID: MediaID?
     private var selectionAnchor: MediaID?
     public private(set) var viewerID: MediaID?
+    /// The photo open in the editor. Nil when the editor is closed; the session lives here rather than in
+    /// the view so a SwiftUI rebuild cannot drop an undo stack.
+    public private(set) var editingSession: EditingSession?
+    public var editorID: MediaID? { editingSession?.source.mediaID }
+    /// The collage being composed, if any. Kept apart from the editor: a collage is a document over several
+    /// photos, and closing one must not close the other.
+    public private(set) var collageSession: CollageSession?
+    public var isCollageOpen: Bool { collageSession != nil }
     /// The trailing inspector. Open by default, because "what is this photo" is the question a gallery
     /// exists to answer, not a power feature.
     public var isInspectorPresented = true
@@ -111,6 +130,10 @@ public final class MediaLibraryModel {
     /// Nil when the caller does not want a third pass at all — every unit test, and any future build that
     /// ships without Vision. The app always passes one.
     private let analysis: AnalysisWorker?
+    /// Nil in unit tests and anywhere the editor is not part of the build; the app always passes one.
+    private let editor: EditService?
+    /// Set by the composition root; nil in tests, which is why every caller treats it as optional.
+    public var actions: MediaLibraryActions?
     private var cursor: SortCursor?
     private var generation = 0
     private var feed: Task<Void, Never>?
@@ -124,7 +147,7 @@ public final class MediaLibraryModel {
     public init(reader: CatalogReader, coordinator: IndexCoordinator, passB: MetadataWorker,
                 thumbnails: ThumbnailService, catalog: Catalog, resolver: any MediaResolving,
                 trashRoot: URL, geocoder: any ReverseGeocoding = AppleGeocoder(),
-                analysis: AnalysisWorker? = nil) {
+                analysis: AnalysisWorker? = nil, editor: EditService? = nil) {
         self.reader = reader
         self.coordinator = coordinator
         self.passB = passB
@@ -135,6 +158,7 @@ public final class MediaLibraryModel {
         self.trash = TrashService(catalog: catalog, resolver: resolver, root: trashRoot)
         self.locations = LocationDeriver(catalog: catalog, geocoder: geocoder)
         self.analysis = analysis
+        self.editor = editor
     }
 
     // MARK: - Lifecycle
@@ -213,6 +237,19 @@ public final class MediaLibraryModel {
         await analysis?.start()
         try? await catalog.pruneDuplicateGroups()
         await purgeExpiredTrash()
+        if let editor {
+            let interrupted = await editor.recoverInterruptedEdits()
+            if interrupted > 0 {
+                notices.append(Notice(
+                    interrupted == 1
+                        ? "An earlier version is available for one photo."
+                        : "Earlier versions are available for \(interrupted) photos.",
+                    detail: "Use Revert to Previous Version on the photo to restore it."
+                ))
+            }
+            let cutoff = Date().addingTimeInterval(-Self.trashRetention)
+            _ = await editor.purgeExpiredBackups(olderThan: cutoff)
+        }
 
         do {
             let resolved = try await coordinator.resolveSources()
@@ -230,6 +267,7 @@ public final class MediaLibraryModel {
         await refreshPlaces()
         await refreshTags()
         await reload()
+
     }
 
     /// The tag shelf, from the analysis pass. Cheap by construction: one grouped count over a small table.
@@ -335,6 +373,10 @@ public final class MediaLibraryModel {
     public func stop() {
         // Closing the window is the end of playback, and it must not wait for the drain to land a batch.
         players.stopAll()
+        editingSession?.cancel()
+        editingSession = nil
+        collageSession?.cancel()
+        collageSession = nil
         feed?.cancel()
         feed = nil
         previewFeed?.cancel()
@@ -748,6 +790,252 @@ public final class MediaLibraryModel {
     /// untouched and a 48 MP frame pays for once and keeps on disk.
     public func viewerImage(for item: MediaItem) async -> CGImage? {
         await thumbnails.image(.init(item: item), bucket: .viewerFull)
+    }
+
+    // MARK: - Editing
+
+    public var hasEditor: Bool { editor != nil }
+
+    /// Whether the editor can open this row right now: a photo whose pixels pass B has already read.
+    public func canEdit(_ item: MediaItem) -> Bool {
+        editor != nil && item.kind == .image && item.pixelSize != nil
+    }
+
+    /// Opens the editor over the grid. Opening from the viewer keeps the viewer behind it, so closing the
+    /// editor returns to the same photo; opening from a tile does not open the viewer behind the editor.
+    public func openEditor(_ id: MediaID, tool: EditorTool = .crop) async {
+        guard let editor else { return }
+        guard let item = items.first(where: { $0.id == id }) else { return }
+        guard item.kind == .image else {
+            notices.append(Notice("Only photos can be edited."))
+            return
+        }
+        guard let stored = item.pixelSize else {
+            notices.append(Notice("This photo is still being read.", detail: "Try again in a moment."))
+            return
+        }
+        if editingSession?.source.mediaID == id { return }
+        editingSession?.cancel()
+        guard let source = await editor.source(for: item) else {
+            notices.append(Notice("The file behind “\(item.name)” could not be found."))
+            return
+        }
+        selectedIDs = [id]
+        selectedID = id
+        selectionAnchor = id
+        let session = EditingSession(
+            source: source, storedSize: stored, orientation: item.orientation ?? 1, service: editor
+        )
+        editingSession = session
+        await session.loadPreview()
+        session.setTool(tool)
+    }
+
+    /// When the newest restorable backup was made, for the inspector's affordance.
+    public func previousVersion(for id: MediaID) async -> Date? {
+        await editor?.backupDate(for: id)
+    }
+
+    public func closeEditor() {
+        editingSession?.cancel()
+        editingSession = nil
+    }
+
+    /// Writes the fields into the files themselves, one row at a time. A failure on one row does not stop
+    /// the others, and the notice names the first reason.
+    @discardableResult
+    public func applyMetadata(_ overrides: MetadataOverrides, to ids: [MediaID]) async -> Bool {
+        guard let editor, !overrides.isEmpty else { return false }
+        let chosen = items.filter { ids.contains($0.id) }
+        guard !chosen.isEmpty else { return false }
+        var written = 0
+        var failure: String?
+        for item in chosen {
+            let outcome = await editor.applyMetadata(overrides, to: item)
+            if outcome.written {
+                written += 1
+            } else if failure == nil {
+                failure = outcome.message
+            }
+        }
+        guard written > 0 else {
+            notices.append(Notice("The metadata could not be written.", detail: failure))
+            return false
+        }
+        notices.append(Notice(
+            written == 1 ? "Metadata written to the file." : "Metadata written to \(written) files.",
+            detail: failure
+        ))
+        await refreshAlbums()
+        await refreshPlaces()
+        await reload()
+        await editingSession?.reloadFileMetadata()
+        return true
+    }
+
+    // MARK: - Replace and revert
+
+    /// The explicit, destructive half of the editor. The service keeps a previous version first, so this
+    /// can always be undone from inside the app.
+    public func replaceEditorOriginal() async {
+        guard let editor, let session = editingSession,
+              let item = items.first(where: { $0.id == session.source.mediaID }) else { return }
+        let outcome = await editor.replaceOriginal(item, recipe: session.recipe)
+        guard outcome.replaced else {
+            notices.append(Notice("The original was not replaced.", detail: outcome.message))
+            return
+        }
+        notices.append(Notice(
+            "The original was replaced.",
+            detail: "A previous version is kept for 30 days; use Revert to Previous Version to restore it."
+        ))
+        closeEditor()
+        await reload()
+        await refreshAlbums()
+        await refreshPlaces()
+    }
+
+    public func revertEditorOriginal() async {
+        guard let editor, let session = editingSession,
+              let item = items.first(where: { $0.id == session.source.mediaID }) else { return }
+        let outcome = await editor.revertToPreviousVersion(item)
+        guard outcome.replaced else {
+            notices.append(Notice("Nothing was restored.", detail: outcome.message))
+            return
+        }
+        notices.append(Notice("The previous version was restored."))
+        closeEditor()
+        await reload()
+        await refreshAlbums()
+        await refreshPlaces()
+    }
+
+    public func revertToPreviousVersion(_ item: MediaItem) async {
+        guard let editor else { return }
+        let outcome = await editor.revertToPreviousVersion(item)
+        guard outcome.replaced else {
+            notices.append(Notice("Nothing was restored.", detail: outcome.message))
+            return
+        }
+        notices.append(Notice("The previous version was restored."))
+        await reload()
+        await refreshAlbums()
+        await refreshPlaces()
+    }
+
+    // MARK: - Collage
+
+    public func createCollage(_ ids: [MediaID]) async {
+        guard let editor else { return }
+        let chosen = items.filter { ids.contains($0.id) && $0.kind == .image }
+        guard chosen.count >= 2 else {
+            notices.append(Notice("Choose at least two photos to make a collage."))
+            return
+        }
+        var members: [MediaID: EditSource] = [:]
+        var sizes: [MediaID: Int] = [:]
+        for item in chosen {
+            guard let source = await editor.source(for: item) else { continue }
+            members[item.id] = source
+            if let pixelSize = item.pixelSize { sizes[item.id] = Int(pixelSize.longSide) }
+        }
+        let ordered = chosen.compactMap { members[$0.id] == nil ? nil : $0.id }
+        guard ordered.count >= 2 else {
+            notices.append(Notice("The selected photos could not be found."))
+            return
+        }
+        editingSession?.cancel()
+        editingSession = nil
+        let session = CollageSession(
+            document: CollageDocument(memberIDs: ordered),
+            members: members,
+            sourceLongSides: sizes,
+            service: editor
+        )
+        collageSession = session
+        await session.renderPreview()
+    }
+
+    public func closeCollage() {
+        collageSession?.cancel()
+        collageSession = nil
+    }
+
+    public func exportCollage(to url: URL) async {
+        guard let editor, let session = collageSession else { return }
+        let written = await editor.writeCollage(
+            session.document,
+            members: session.members,
+            sourceLongSides: session.sourceLongSides,
+            to: url
+        )
+        notices.append(written
+            ? Notice("Exported “\(url.lastPathComponent)”.", detail: url.deletingLastPathComponent().path)
+            : Notice("The collage could not be exported.",
+                     detail: "Choose a folder Gallery can write to."))
+    }
+
+    /// A batch copy of the selection, at the destination and with the naming policy the panel returned.
+    public private(set) var exportProgress: Exporter.Progress?
+    public var isExporting: Bool { exportProgress != nil }
+
+    public func exportCopies(
+        _ ids: [MediaID], to folder: URL, policy: ExportNaming.Policy
+    ) async {
+        guard let editor else { return }
+        let chosen = items.filter { ids.contains($0.id) && $0.kind == .image }
+        guard !chosen.isEmpty else {
+            notices.append(Notice("There are no photos in this selection to export."))
+            return
+        }
+        var requests: [ExportRequest] = []
+        for item in chosen {
+            guard let source = await editor.source(for: item) else { continue }
+            var recipe = EditRecipe()
+            recipe.format = OutputFormat(kind: OutputFormats.kind(for: source.url) ?? .jpeg)
+            requests.append(ExportRequest(source: source, recipe: recipe))
+        }
+        guard !requests.isEmpty else {
+            notices.append(Notice("The selected files could not be found."))
+            return
+        }
+        exportProgress = Exporter.Progress(completed: 0, total: requests.count)
+        let outcome = await editor.exportCopies(requests, to: folder, policy: policy) { [weak self] progress in
+            Task { @MainActor in self?.exportProgress = progress }
+        }
+        exportProgress = nil
+        var detail = folder.path
+        if !outcome.failed.isEmpty {
+            detail += " — " + (outcome.failed.values.first?.userMessage ?? "")
+        }
+        if !outcome.skipped.isEmpty {
+            detail += " — \(outcome.skipped.count) skipped because a file with that name exists."
+        }
+        notices.append(Notice(
+            outcome.written.count == 1
+                ? "Exported one copy."
+                : "Exported \(outcome.written.count) copies.",
+            detail: detail
+        ))
+    }
+
+    public func cancelExport() async {
+        await editor?.cancelExport()
+    }
+
+    /// The editor's one write action so far: a copy, at a destination the user chose in a panel.
+    public func exportEditorCopy(to destination: URL) async {
+        guard let editor, let session = editingSession else { return }
+        let request = ExportRequest(source: session.source, recipe: session.recipe)
+        switch await editor.exportCopy(request, to: destination) {
+        case .success(let url):
+            notices.append(Notice(
+                "Exported “\(url.lastPathComponent)”.",
+                detail: url.deletingLastPathComponent().path
+            ))
+        case .failure(let error):
+            notices.append(Notice("The copy could not be exported.", detail: error.userMessage))
+        }
     }
 
     public func toggleFavorite(_ id: MediaID) async {

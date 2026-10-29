@@ -60,6 +60,38 @@ struct GalleryCommands: Commands {
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(model.selectedID == nil)
 
+            Button("Edit…") {
+                guard let id = model.selectedID else { return }
+                Task { await model.openEditor(id) }
+            }
+            .keyboardShortcut("e", modifiers: .command)
+            .disabled(!canEditSelection)
+
+            Button("Edit Metadata…") {
+                guard let id = model.selectedID else { return }
+                Task { await model.openEditor(id, tool: .metadata) }
+            }
+            .disabled(!canEditSelection)
+
+            Button("Export a Copy…") {
+                let ids = model.selectedMediaIDs
+                Task { await ExportPicker.presentBatchExport(ids, into: model) }
+            }
+            .keyboardShortcut("e", modifiers: [.command, .shift])
+            .disabled(model.selectedItems.allSatisfy { $0.kind != .image })
+
+            Button("Create Collage…") {
+                let ids = model.selectedMediaIDs
+                Task { await model.createCollage(ids) }
+            }
+            .disabled(model.selectedItems.filter { $0.kind == .image }.count < 2)
+
+            Button("Revert to Previous Version") {
+                guard let item = model.selectedItem else { return }
+                Task { await model.revertToPreviousVersion(item) }
+            }
+            .disabled(model.selectedItem?.kind != .image)
+
             Divider()
 
             Button(favoriteTitle) {
@@ -86,6 +118,11 @@ struct GalleryCommands: Commands {
             Button("Select All") { model.selectAll() }
                 .keyboardShortcut("a", modifiers: .command)
         }
+    }
+
+    private var canEditSelection: Bool {
+        guard let item = model.selectedItem else { return false }
+        return model.canEdit(item)
     }
 
     /// The star's menu title follows what the selection would do, which is the difference between undoing a

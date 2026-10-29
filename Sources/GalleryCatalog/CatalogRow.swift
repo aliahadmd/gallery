@@ -62,6 +62,7 @@ enum CatalogRow {
             device: try row.optionalString(named: "device"),
             lens: try row.optionalString(named: "lens"),
             searchText: try row.optionalString(named: "search_text"),
+            title: try row.optionalString(named: "title"),
             isFavorite: try row.bool(named: "is_favorite"),
             trash: TrashState(rawValue: Int16(truncatingIfNeeded: try row.int64(named: "trash"))) ?? .live,
             isOffline: try row.bool(named: "is_offline"),
@@ -130,7 +131,10 @@ enum CatalogRow {
             byteSize: try row.int64(named: "byte_size"),
             trashedAt: Date(nanoseconds: try row.int64(named: "trashed_ns")),
             restoredAt: try row.optionalInt64(named: "restored_ns").map(Date.init(nanoseconds:)),
-            restoreError: try row.optionalString(named: "restore_err")
+            restoreError: try row.optionalString(named: "restore_err"),
+            completedAt: try row.optionalInt64(named: "completed_ns").map(Date.init(nanoseconds:)),
+            resultStatHash: try row.optionalInt64(named: "result_stat_hash")
+                .map { UInt64(bitPattern: $0) }
         )
     }
 
@@ -213,7 +217,7 @@ enum CatalogRow {
     media.px_w, media.px_h, media.orientation, media.color_space, media.duration_us, media.codec,
     media.cap_utc, media.cap_wall, media.cap_tz, media.cap_src,
     media.lat, media.lon, media.has_gps, media.place_key, media.cluster_id, media.device, media.lens,
-    media.search_text, media.is_offline, media.trash, media.aesthetic, media.is_utility,
+    media.search_text, media.title, media.is_offline, media.trash, media.aesthetic, media.is_utility,
     CASE WHEN favorite.media_id IS NULL THEN 0 ELSE 1 END AS is_favorite
     """
 

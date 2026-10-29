@@ -23,7 +23,7 @@ struct AnalysisTests {
         )
     }
 
-    @Test("A v2 library walks forward to v3 with its rows, and the two shapes agree column for column")
+    @Test("A v2 library walks forward to the current schema, and the two shapes agree column for column")
     func v2WalksForwardToV3() async throws {
         let fixture = try await CatalogFixture()
         defer { fixture.tearDown() }
@@ -49,12 +49,120 @@ struct AnalysisTests {
         #expect(migrated == fresh, "ALTER TABLE and Schema.create have to agree column for column")
 
         let fts = try columns(of: fixture.databaseURL, table: "media_fts")
-        #expect(fts == ["name", "place_key", "device", "lens", "search_text", "search_tags", "search_ocr"])
+        #expect(fts == ["name", "place_key", "device", "lens", "search_text", "search_tags", "search_ocr",
+                       "title"])
 
         // The row written before the upgrade is still searchable through the recreated index.
         let reader = try CatalogReader.open(at: fixture.databaseURL)
         let hits = try await reader.search("kyoto")
         #expect(hits.count == 1, "the rebuild after the migration reindexed the old rows")
+    }
+
+    @Test("A v3 library walks forward to v4, and the title it gains is searchable")
+    func v3WalksForwardToV4() async throws {
+        let fixture = try await CatalogFixture()
+        defer { fixture.tearDown() }
+        let source = try await fixture.addSource()
+        let ids = try await fixture.record([makeItem("IMG_0001.JPG", documentID: 1, sourceID: source.id)])
+
+        let downgraded = try SQLiteHandle.open(path: fixture.databaseURL.path, kind: .readWrite)
+        try downgraded.write {
+            try downgraded.downgradeToV3()
+            try downgraded.setUserVersion(3)
+        }
+        _ = try await fixture.reopened()
+
+        let referenceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gallery-schema-reference-\(UUID().uuidString).db")
+        defer { try? FileManager.default.removeItem(at: referenceURL) }
+        _ = try Catalog.open(at: referenceURL)
+        #expect(try columns(of: fixture.databaseURL, table: "media")
+                == columns(of: referenceURL, table: "media"))
+        #expect(try columns(of: fixture.databaseURL, table: "media_fts")
+                == ["name", "place_key", "device", "lens", "search_text", "search_tags", "search_ocr",
+                    "title"])
+
+        // A title written into the row is indexed by the trigger, and the search says where it hit.
+        let writer = try SQLiteHandle.open(path: fixture.databaseURL.path, kind: .readWrite)
+        try writer.exec("UPDATE media SET title = ? WHERE id = ?",
+                        [.text("Kyoto at dusk"), .integer(ids[0].rawValue)])
+        let reader = try CatalogReader.open(at: fixture.databaseURL)
+        let hits = try await reader.search("kyoto")
+        #expect(hits.count == 1)
+        #expect(hits.first?.matched == .title)
+        #expect(hits.first?.item.title == "Kyoto at dusk")
+        #expect(hits.first?.snippet.contains("Kyoto") == true)
+    }
+
+    @Test("A stale pass-B write lands on zero rows instead of undoing an edit")
+    func metadataWriteIsCompareAndSet() async throws {
+        let fixture = try await CatalogFixture()
+        defer { fixture.tearDown() }
+        let source = try await fixture.addSource()
+        let ids = try await fixture.record([makeItem("IMG_0001.JPG", documentID: 1, sourceID: source.id)])
+        let row = try #require(await fixture.reader.item(id: ids[0]))
+
+        #expect(try await fixture.catalog.recordMetadata([row.decoded()]).isEmpty,
+                "the row still describes the bytes the item was read from")
+
+        // The file changes under the decode: a new size means a new stat hash.
+        try await fixture.record([makeItem("IMG_0001.JPG", documentID: 1, sourceID: source.id, size: 4096)])
+
+        let refused = try await fixture.catalog.recordMetadata([row.decoded(title: "Stale title")])
+        #expect(refused == [ids[0]])
+        let current = try #require(await fixture.reader.item(id: ids[0]))
+        #expect(current.title == nil, "a refused write must not have landed")
+    }
+
+    @Test("commitEdit is a compare-and-set, and only a pixel edit resets what the old pixels taught")
+    func commitEditWritesAndResets() async throws {
+        let fixture = try await CatalogFixture()
+        defer { fixture.tearDown() }
+        let source = try await fixture.addSource()
+        let ids = try await fixture.record([makeItem("IMG_0001.JPG", documentID: 1, sourceID: source.id)])
+        let row = try #require(await fixture.reader.item(id: ids[0]))
+        try await fixture.catalog.recordAnalysis([analysis(ids[0], ocr: "invoice total")])
+
+        let capture = CaptureMoment(
+            instant: Date(timeIntervalSince1970: 1_700_000_000),
+            wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+            timeZone: TimeZone(secondsFromGMT: 0),
+            source: .exifOffsetTimeOriginal
+        )
+        let stat = FileStat(
+            size: 1234, modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+            creationDate: nil, inode: 7, statHash: 42
+        )
+        let refused = try await fixture.catalog.commitEdit(MediaEditCommit(
+            mediaID: ids[0], expectedStatHash: row.identity.statHash &+ 1, stat: stat,
+            pixelsChanged: false, projection: EditProjection(title: "Nope", capture: capture, gps: nil)
+        ))
+        #expect(!refused, "a stale expected hash must not land")
+
+        let committed = try await fixture.catalog.commitEdit(MediaEditCommit(
+            mediaID: ids[0], expectedStatHash: row.identity.statHash, stat: stat,
+            pixelsChanged: false, projection: EditProjection(title: "Kyoto", capture: capture, gps: nil)
+        ))
+        #expect(committed)
+        let updated = try #require(await fixture.reader.item(id: ids[0]))
+        #expect(updated.title == "Kyoto")
+        #expect(updated.stage == .thumbnailed, "a metadata edit leaves the poster valid")
+        #expect(updated.identity.statHash == 42)
+        #expect(updated.capture?.instant == capture.instant)
+        #expect(try await fixture.reader.search("kyoto").first?.matched == .title)
+        #expect(try await fixture.reader.search("invoice").count == 1,
+                "a metadata edit does not invalidate the analysis")
+
+        let statAfterPixels = FileStat(
+            size: 4321, modificationDate: Date(), creationDate: nil, inode: 7, statHash: 99
+        )
+        let pixelEdit = try await fixture.catalog.commitEdit(MediaEditCommit(
+            mediaID: ids[0], expectedStatHash: 42, stat: statAfterPixels, pixelsChanged: true
+        ))
+        #expect(pixelEdit)
+        let after = try #require(await fixture.reader.item(id: ids[0]))
+        #expect(after.stage == .classified, "new pixels go back through pass B")
+        #expect(try await fixture.reader.search("invoice").isEmpty, "derived text is cleared")
     }
 
     private func columns(of url: URL, table: String) throws -> [String] {

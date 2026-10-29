@@ -11,4 +11,6 @@ public enum Log {
     public static let ui = Logger(subsystem: subsystem, category: "ui")
     /// The third pass: what Vision found, what it cost, and what it skipped.
     public static let analysis = Logger(subsystem: subsystem, category: "analysis")
+    /// The editor: what was rendered, what was exported, and why either refused.
+    public static let editing = Logger(subsystem: subsystem, category: "editing")
 }

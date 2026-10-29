@@ -26,6 +26,7 @@ final class Fixture {
     let catalog: Catalog
     let reader: CatalogReader
     let coordinator: IndexCoordinator
+    let editor: EditService
     let model: MediaLibraryModel
     let suiteName: String
     let defaults: UserDefaults
@@ -60,9 +61,12 @@ final class Fixture {
         let resolver = CatalogMediaResolver(reader: reader, bookmarks: bookmarks)
         let pipeline = Self.pipeline(under: home, catalog: catalog, reader: reader, resolver: resolver)
         coordinator = walk
+        editor = EditService(resolver: resolver, catalog: catalog,
+                             trashRoot: home.appendingPathComponent("trash", isDirectory: true))
         model = MediaLibraryModel(reader: reader, coordinator: walk, passB: pipeline.worker,
                                   thumbnails: pipeline.thumbnails, catalog: catalog, resolver: resolver,
-                                  trashRoot: home.appendingPathComponent("trash", isDirectory: true))
+                                  trashRoot: home.appendingPathComponent("trash", isDirectory: true),
+                                  editor: editor)
         drains.append(pipeline.worker)
     }
 
@@ -88,12 +92,16 @@ final class Fixture {
         let secondResolver = CatalogMediaResolver(reader: secondReader, bookmarks: bookmarks)
         let pipeline = Self.pipeline(under: directory, catalog: secondCatalog, reader: secondReader,
                                      resolver: secondResolver)
+        let secondEditor = EditService(
+            resolver: secondResolver, catalog: secondCatalog,
+            trashRoot: directory.appendingPathComponent("trash", isDirectory: true))
         drains.append(pipeline.worker)
         return Relaunch(model: MediaLibraryModel(reader: secondReader, coordinator: second,
                                                  passB: pipeline.worker, thumbnails: pipeline.thumbnails,
                                                  catalog: secondCatalog, resolver: secondResolver,
                                                  trashRoot: directory.appendingPathComponent("trash",
-                                                                                             isDirectory: true)),
+                                                                                             isDirectory: true),
+                                                 editor: secondEditor),
                         coordinator: second)
     }
 

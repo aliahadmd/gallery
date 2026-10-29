@@ -75,6 +75,9 @@ public enum TrashState: Int16, Sendable, Hashable, Codable {
     case restored = 2
     case lost = 3
     case purged = 4
+    /// A previous version kept by Replace Original. The row stays live and in every album — a backup is
+    /// not a deletion, and the ledger's purge sweep must never treat it as one.
+    case backup = 5
 
     /// Trashed rows must leave every album; `lost` means the user emptied Trash behind our back.
     public var hidesFromAlbums: Bool { self == .trashed || self == .purged }
@@ -174,6 +177,10 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
     public var device: String?
     public var lens: String?
     public var searchText: String?
+    /// A title the user wrote, read back from the file (IPTC ObjectName). Nil means the file carries none —
+    /// deliberately not defaulted to the filename, because the UI already falls back to that and a stored
+    /// copy would make "clear the title" impossible to represent.
+    public var title: String?
 
     public var isFavorite: Bool
     public var trash: TrashState
@@ -217,6 +224,7 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
         device: String? = nil,
         lens: String? = nil,
         searchText: String? = nil,
+        title: String? = nil,
         isFavorite: Bool = false,
         trash: TrashState = .live,
         isOffline: Bool = false,
@@ -252,6 +260,7 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
         self.device = device
         self.lens = lens
         self.searchText = searchText
+        self.title = title
         self.isFavorite = isFavorite
         self.trash = trash
         self.isOffline = isOffline

@@ -65,6 +65,7 @@ public enum ImageMetadataReader {
         let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]
         let aux = properties[kCGImagePropertyExifAuxDictionary] as? [CFString: Any] ?? [:]
         let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any] ?? [:]
+        let iptc = properties[kCGImagePropertyIPTCDictionary] as? [CFString: Any] ?? [:]
 
         var metadata = FileMetadata()
         metadata.typeIdentifier = CGImageSourceGetType(source) as String?
@@ -73,6 +74,9 @@ public enum ImageMetadataReader {
         metadata.colorSpace = colorSpace(properties)
         metadata.frameCount = CGImageSourceGetCount(source)
         metadata.dpiWidth = number(tiff[kCGImagePropertyTIFFXResolution])
+        let title = text(iptc[kCGImagePropertyIPTCObjectName])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        metadata.title = (title?.isEmpty ?? true) ? nil : title
         metadata.device = device(tiff: tiff, exif: exif)
         metadata.lens = text(exif[kCGImagePropertyExifLensModel]) ?? text(aux[kCGImagePropertyExifAuxLensModel])
         metadata.gps = gps(properties[kCGImagePropertyGPSDictionary] as? [CFString: Any])

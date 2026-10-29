@@ -24,7 +24,12 @@ let package = Package(
         ),
         .target(
             name: "GalleryIndexing",
-            dependencies: ["GalleryDomain", "GallerySupport", "GalleryCatalog", "GalleryImaging"]
+            dependencies: ["GalleryDomain", "GallerySupport", "GalleryCatalog", "GalleryImaging",
+                           "GalleryEditing"]
+        ),
+        .target(
+            name: "GalleryEditing",
+            dependencies: ["GalleryDomain", "GallerySupport", "GalleryImaging"]
         ),
         // Vision lives here and nowhere else: the indexing passes must not grow a dependency on a framework
         // whose cost is measured in hundreds of milliseconds per file. The resolver protocol is shared with
@@ -62,9 +67,13 @@ let package = Package(
                            "GallerySupport"]
         ),
         .testTarget(
+            name: "GalleryEditingTests",
+            dependencies: ["GalleryEditing", "GalleryImaging", "GalleryDomain"]
+        ),
+        .testTarget(
             name: "GalleryUITests",
-            dependencies: ["GalleryUI", "GalleryIndexing", "GalleryImaging", "GalleryCatalog",
-                           "GalleryDomain", "GallerySupport"]
+            dependencies: ["GalleryUI", "GalleryIndexing", "GalleryEditing", "GalleryImaging",
+                           "GalleryCatalog", "GalleryDomain", "GallerySupport"]
         ),
         .testTarget(
             name: "GalleryAnalysisTests",

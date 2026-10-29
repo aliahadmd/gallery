@@ -71,6 +71,22 @@ public struct MediaCellView: View {
         }
         .contextMenu {
             Button("Open") { model.openViewer(item.id) }
+            if model.canEdit(item) {
+                Button("Edit…") { Task { await model.openEditor(item.id) } }
+            }
+            if let actions = model.actions {
+                Button("Export a Copy…") { Task { await actions.exportCopies([item.id]) } }
+            }
+            if model.selectedMediaIDs.count >= 2 {
+                Button("Create Collage…") {
+                    Task { await model.createCollage(model.selectedMediaIDs) }
+                }
+            }
+            if item.kind == .image {
+                Button("Revert to Previous Version") {
+                    Task { await model.revertToPreviousVersion(item) }
+                }
+            }
             Button(item.isFavorite ? "Remove from Favorites" : "Add to Favorites") {
                 Task { await model.toggleFavorite(item.id) }
             }
@@ -144,7 +160,9 @@ public struct MediaCellView: View {
     }
 
     private var captionText: String {
-        guard let snippet = model.searchSnippets[item.id], !snippet.isEmpty else { return item.name }
+        guard let snippet = model.searchSnippets[item.id], !snippet.isEmpty else {
+            return item.title ?? item.name
+        }
         return snippet
             .replacingOccurrences(of: "[", with: "")
             .replacingOccurrences(of: "]", with: "")

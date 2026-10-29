@@ -89,6 +89,15 @@ public struct LibraryGridView: View {
                             }
                             .help("Open the selected photo (Return)")
 
+                            if model.canEdit(selected) {
+                                Button {
+                                    Task { await model.openEditor(selected.id) }
+                                } label: {
+                                    Label("Edit", systemImage: "slider.horizontal.3")
+                                }
+                                .help("Crop, resize or convert a copy (⌘E)")
+                            }
+
                             if model.selection == .duplicates {
                                 Button {
                                     Task { await model.keepBestAndTrashRest(around: selected) }
@@ -97,6 +106,24 @@ public struct LibraryGridView: View {
                                 }
                                 .help("Keep the best shot of this set and move the rest to Trash")
                             }
+                        }
+
+                        if model.actions != nil, model.selectedItems.contains(where: { $0.kind == .image }) {
+                            Button {
+                                Task { await model.actions?.exportCopies(model.selectedMediaIDs) }
+                            } label: {
+                                Label("Export", systemImage: "square.and.arrow.up")
+                            }
+                            .help(count > 1 ? "Export \(count) copies…" : "Export a copy…")
+                        }
+
+                        if model.selectedItems.filter({ $0.kind == .image }).count >= 2 {
+                            Button {
+                                Task { await model.createCollage(model.selectedMediaIDs) }
+                            } label: {
+                                Label("Collage", systemImage: "square.grid.2x2")
+                            }
+                            .help("Make a collage from the selected photos")
                         }
                     }
                 }
@@ -136,7 +163,12 @@ public struct LibraryGridView: View {
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 400)
         }
         .overlay(alignment: .bottomTrailing) {
-            if let progress = model.activeProgress, progress.phase.isCounting {
+            if let progress = model.exportProgress {
+                ExportProgressHUD(progress: progress) {
+                    Task { await model.cancelExport() }
+                }
+                .padding(12)
+            } else if let progress = model.activeProgress, progress.phase.isCounting {
                 IndexProgressHUD(
                     progress: progress,
                     onPause: model.canPauseScan(progress)

@@ -24,7 +24,10 @@ final class AppContainer {
             // One bookmark store for both passes: pass A rebinds folder roots and pass B rebinds file paths,
             // and a grant that resolves for one of them resolves for the other.
             let bookmarks = BookmarkStore()
-            let coordinator = IndexCoordinator(catalog: catalog, reader: reader, bookmarks: bookmarks)
+            // The editor's own writes must not look like a user edit to the watcher.
+            let selfWrites = SelfWriteGuard()
+            let coordinator = IndexCoordinator(catalog: catalog, reader: reader, bookmarks: bookmarks,
+                                               selfWrites: selfWrites)
 
             let cache = try Self.cacheRoot()
             let store = ThumbnailStore(layout: ThumbnailLayout(root: cache),
@@ -38,11 +41,24 @@ final class AppContainer {
             let analysis = AnalysisWorker(catalog: catalog, resolver: resolver,
                                           configuration: .init(gate: { await worker.isRunning }))
 
-            model = MediaLibraryModel(reader: reader, coordinator: coordinator, passB: worker,
-                                      thumbnails: thumbnails, catalog: catalog, resolver: resolver,
-                                      trashRoot: url.deletingLastPathComponent()
-                                          .appendingPathComponent("GalleryTrash", isDirectory: true),
-                                      analysis: analysis)
+            let library = MediaLibraryModel(reader: reader, coordinator: coordinator, passB: worker,
+                                            thumbnails: thumbnails, catalog: catalog, resolver: resolver,
+                                            trashRoot: url.deletingLastPathComponent()
+                                                .appendingPathComponent("GalleryTrash", isDirectory: true),
+                                            analysis: analysis,
+                                            editor: EditService(
+                                                resolver: resolver, catalog: catalog,
+                                                trashRoot: url.deletingLastPathComponent()
+                                                    .appendingPathComponent("GalleryTrash", isDirectory: true),
+                                                selfWrites: selfWrites
+                                            ))
+            library.actions = MediaLibraryActions(
+                exportCopies: { [weak library] ids in
+                    guard let library else { return }
+                    await ExportPicker.presentBatchExport(ids, into: library)
+                }
+            )
+            model = library
             startupFailure = nil
         } catch {
             model = nil

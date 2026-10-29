@@ -19,6 +19,11 @@ public enum CatalogMigrations {
         // `Catalog.open` rebuilds it after the step lands.
         Migration(version: 3, name: "v3 analysis results and derived search columns",
                   up: { try $0.exec(Self.v3) }),
+        // v4 adds what the editor needs: a title the user wrote, the two columns a backup needs to be
+        // reverted safely, and an FTS index that can find the title. The virtual table is replaced rather
+        // than altered, and `Catalog.open` rebuilds it after the step lands.
+        Migration(version: 4, name: "v4 titles, backup completion and the eight-column index",
+                  up: { try $0.exec(Self.v4) }),
     ]
 
     private static let v2 = """
@@ -142,6 +147,47 @@ public enum CatalogMigrations {
       INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr)
       VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
               new.search_ocr);
+    END;
+    """
+
+    /// Appended columns and a replaced FTS table. `Schema.create` must leave the same columns in the same
+    /// order; the migration test compares the two.
+    private static let v4 = """
+    ALTER TABLE media ADD COLUMN title TEXT;
+    ALTER TABLE trash_ledger ADD COLUMN completed_ns INTEGER;
+    ALTER TABLE trash_ledger ADD COLUMN result_stat_hash INTEGER;
+
+    DROP TRIGGER media_fts_ai;
+    DROP TRIGGER media_fts_ad;
+    DROP TRIGGER media_fts_au;
+    DROP TABLE media_fts;
+    CREATE VIRTUAL TABLE media_fts USING fts5(
+      name, place_key, device, lens, search_text, search_tags, search_ocr, title,
+      content='media', content_rowid='id',
+      tokenize='porter unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER media_fts_ai AFTER INSERT ON media BEGIN
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr,
+                            title)
+      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
+              new.search_ocr, new.title);
+    END;
+    CREATE TRIGGER media_fts_ad AFTER DELETE ON media BEGIN
+      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
+                            search_ocr, title)
+      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
+              old.search_tags, old.search_ocr, old.title);
+    END;
+    CREATE TRIGGER media_fts_au AFTER UPDATE OF name, place_key, device, lens, search_text, search_tags,
+                                             search_ocr, title ON media BEGIN
+      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
+                            search_ocr, title)
+      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
+              old.search_tags, old.search_ocr, old.title);
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr,
+                            title)
+      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
+              new.search_ocr, new.title);
     END;
     """
 }
@@ -329,16 +375,23 @@ public actor Catalog {
 
     // MARK: - Metadata (pass B)
 
-    public func recordMetadata(_ items: [MediaItem]) throws {
-        guard !items.isEmpty else { return }
-        try handle.write {
+    /// Returns the rows the CAS refused: the file changed between pass B's decode and this write, so the
+    /// item describes bytes that are no longer there. The worker re-queues those instead of retiring them.
+    @discardableResult
+    public func recordMetadata(_ items: [MediaItem]) throws -> [MediaID] {
+        guard !items.isEmpty else { return [] }
+        return try handle.write {
+            var refused: [MediaID] = []
             for item in items {
                 try updateMetadata.run(MediaStatements.metadataValues(item))
+                if handle.changes == 0 { refused.append(item.id) }
             }
+            return refused
         }
     }
 
-    public func recordMetadata(_ item: MediaItem) throws {
+    @discardableResult
+    public func recordMetadata(_ item: MediaItem) throws -> [MediaID] {
         try recordMetadata([item])
     }
 
@@ -457,7 +510,10 @@ public actor Catalog {
     /// trashed again has three and only the last one describes where it is now.
     public func trashEntry(for mediaID: MediaID) throws -> TrashLedgerEntry? {
         try handle.firstRow(
-            "SELECT * FROM trash_ledger WHERE media_id = ? ORDER BY trashed_ns DESC, id DESC LIMIT 1",
+            """
+            SELECT * FROM trash_ledger WHERE media_id = ? AND mode <> 2
+            ORDER BY trashed_ns DESC, id DESC LIMIT 1
+            """,
             [.integer(mediaID.rawValue)]
         ).map(CatalogRow.trashEntry)
     }
@@ -471,10 +527,111 @@ public actor Catalog {
         }
     }
 
-    public func purgeOlderThan(_ date: Date) throws -> [TrashLedgerEntry] {        try handle.query(
-            "SELECT * FROM trash_ledger WHERE state = ? AND trashed_ns < ?",
+    /// Genuinely trashed rows only. A backup older than the cutoff is retired by `purgeExpiredBackups`, not
+    /// here: purging one would mark a *visible* photo as deleted.
+    public func purgeOlderThan(_ date: Date) throws -> [TrashLedgerEntry] {
+        try handle.query(
+            "SELECT * FROM trash_ledger WHERE state = ? AND trashed_ns < ? AND mode <> 2",
             [.integer(Int64(TrashState.trashed.rawValue)), .integer(date.nanoseconds)]
         ).map { try CatalogRow.trashEntry($0) }
+    }
+
+    // MARK: - Previous versions
+
+    /// The ledger row exists before the copy, mirroring the trash ledger's rule: it is the undo log, not a
+    /// report written afterwards.
+    public func beginBackup(_ entry: TrashLedgerEntry) throws -> Int64 {
+        try handle.write {
+            let row = try handle.firstRow(
+                """
+                INSERT INTO trash_ledger (media_id, src_id, from_rel, from_volume, to_rel, mode, state,
+                                          byte_size, trashed_ns)
+                VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?) RETURNING id
+                """,
+                [.integer(entry.mediaID.rawValue), .integer(entry.sourceID.rawValue),
+                 .text(entry.fromRelativePath), .text(entry.fromVolumeID),
+                 entry.toRelativePath.map(Value.text) ?? .null,
+                 .integer(Int64(TrashState.backup.rawValue)), .integer(entry.byteSize),
+                 .integer(entry.trashedAt.nanoseconds)]
+            )
+            guard let row, case .integer(let id) = try row[0] else {
+                throw SQLiteError.noRows(sql: "INSERT INTO trash_ledger")
+            }
+            return id
+        }
+    }
+
+    /// The same storage as a trashed file's destination; named for the caller that has no trash in mind.
+    public func recordBackupDestination(ledgerID: Int64, path: String) throws {
+        try recordTrashDestination(ledgerID: ledgerID, path: path)
+    }
+
+    public func completeBackup(ledgerID: Int64, resultStatHash: UInt64) throws {
+        try handle.write {
+            try handle.exec(
+                "UPDATE trash_ledger SET completed_ns = ?, result_stat_hash = ? WHERE id = ?",
+                [.integer(Date().nanoseconds), .integer(Int64(bitPattern: resultStatHash)),
+                 .integer(ledgerID)]
+            )
+        }
+    }
+
+    public func failBackup(ledgerID: Int64, error: String) throws {
+        try handle.write {
+            try handle.exec(
+                "UPDATE trash_ledger SET state = ?, restore_err = ? WHERE id = ?",
+                [.integer(Int64(TrashState.lost.rawValue)), .text(error), .integer(ledgerID)]
+            )
+        }
+    }
+
+    /// The newest backup that has somewhere to restore from. Pending rows are included so a crash mid-write
+    /// still surfaces an undo rather than hiding it behind a completed flag that never landed.
+    public func latestBackup(mediaID: MediaID) throws -> TrashLedgerEntry? {
+        try handle.firstRow(
+            """
+            SELECT * FROM trash_ledger WHERE media_id = ? AND mode = 2 AND to_rel IS NOT NULL
+            ORDER BY trashed_ns DESC, id DESC LIMIT 1
+            """,
+            [.integer(mediaID.rawValue)]
+        ).map(CatalogRow.trashEntry)
+    }
+
+    public func pendingBackups() throws -> [TrashLedgerEntry] {
+        try handle.query(
+            "SELECT * FROM trash_ledger WHERE mode = 2 AND completed_ns IS NULL ORDER BY id"
+        ).map(CatalogRow.trashEntry)
+    }
+
+    public func recordBackupRestored(ledgerID: Int64) throws {
+        try handle.write {
+            try handle.exec(
+                "UPDATE trash_ledger SET state = ?, restored_ns = ? WHERE id = ?",
+                [.integer(Int64(TrashState.restored.rawValue)), .integer(Date().nanoseconds),
+                 .integer(ledgerID)]
+            )
+        }
+    }
+
+    /// Backups older than the cutoff, marked lost so the sweep knows they are gone. The files are the
+    /// caller's to remove — the catalog does not know where the trash root is.
+    public func purgeExpiredBackups(olderThan date: Date) throws -> [TrashLedgerEntry] {
+        try handle.write {
+            let expired = try handle.query(
+                """
+                SELECT * FROM trash_ledger WHERE mode = 2 AND state = ? AND trashed_ns < ?
+                ORDER BY trashed_ns
+                """,
+                [.integer(Int64(TrashState.backup.rawValue)), .integer(date.nanoseconds)]
+            ).map(CatalogRow.trashEntry)
+            for row in expired {
+                try handle.exec(
+                    "UPDATE trash_ledger SET state = ? WHERE id = ?",
+                    [.integer(Int64(TrashState.lost.rawValue)), .integer(row.id)]
+                )
+            }
+            return expired
+        }
     }
 
     public func recordPurge(ledgerID: Int64, mediaID: MediaID) throws {
@@ -600,7 +757,7 @@ public actor Catalog {
     /// `rank` is the file's own modification date in whole days, computed in the `SELECT` because the queue
     /// is filled from the table: it is what makes pass B's order "viewport first, then newest, then the tail"
     /// cost nothing at claim time. A day is the grain because a day is what the user can see in the timeline.
-    private static func queueInsert(matching filter: String) -> String {
+    static func queueInsert(matching filter: String) -> String {
         """
         INSERT INTO scan_queue (src_id, media_id, kind, priority, rank, enqueued_ns)
         SELECT src_id, id, 1, ?, COALESCE(mtime_ns, 0) / 86_400_000_000_000, ? FROM media
@@ -777,6 +934,9 @@ public struct WorkItem: Sendable, Hashable {
 public enum TrashMode: Int16, Sendable, Hashable, Codable {
     case systemTrash = 0
     case appTrash = 1
+    /// A previous version kept by Replace Original. Never a deletion: `trashEntry(for:)` and the purge
+    /// sweeps filter it out, because resurrecting one would hide a live photo.
+    case editBackup = 2
 }
 
 /// One answer from the geocode cache. `didFail` is a real answer: a machine that was offline when a place
@@ -808,6 +968,10 @@ public struct TrashLedgerEntry: Identifiable, Sendable, Hashable {
     public var trashedAt: Date
     public var restoredAt: Date?
     public var restoreError: String?
+    /// Backups only: when the write finished, and the stat hash the file had afterwards. Revert is refused
+    /// when the file has moved on since.
+    public var completedAt: Date?
+    public var resultStatHash: UInt64?
 
     public init(
         id: Int64 = 0,
@@ -821,7 +985,9 @@ public struct TrashLedgerEntry: Identifiable, Sendable, Hashable {
         byteSize: Int64 = 0,
         trashedAt: Date = Date(),
         restoredAt: Date? = nil,
-        restoreError: String? = nil
+        restoreError: String? = nil,
+        completedAt: Date? = nil,
+        resultStatHash: UInt64? = nil
     ) {
         self.id = id
         self.mediaID = mediaID
@@ -835,5 +1001,7 @@ public struct TrashLedgerEntry: Identifiable, Sendable, Hashable {
         self.trashedAt = trashedAt
         self.restoredAt = restoredAt
         self.restoreError = restoreError
+        self.completedAt = completedAt
+        self.resultStatHash = resultStatHash
     }
 }

@@ -115,6 +115,7 @@ extension MediaItem {
         pixels: PixelSize? = nil,
         device: String? = nil,
         search: String? = nil,
+        title: String? = nil,
         stage: IndexStage = .thumbnailed,
         error: IndexError = .none
     ) -> MediaItem {
@@ -124,6 +125,7 @@ extension MediaItem {
         copy.pixelSize = pixels
         copy.device = device
         copy.searchText = search
+        copy.title = title
         copy.stage = stage
         copy.error = error
         return copy

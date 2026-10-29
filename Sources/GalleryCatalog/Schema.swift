@@ -5,7 +5,7 @@ import GallerySQLite
 /// can fail at runtime has no business standing between the app and its index.
 public enum Schema {
     /// Bump only together with an appended `Migration`.
-    public static let version: Int32 = 3
+    public static let version: Int32 = 4
 
     /// A fresh install gets this; an existing library gets `migrations` applied on top of its own version.
     public static let create = """
@@ -76,7 +76,10 @@ public enum Schema {
       -- Derived search text, owned by the analysis pass. Separate from `search_text` (which pass B rewrites
       -- wholesale from the file's own vocabulary) so re-analysis is idempotent and rank weights differ.
       search_tags       TEXT,
-      search_ocr        TEXT
+      search_ocr        TEXT,
+      -- A title the user wrote, written into the file and re-derived by pass B. Appended, not inserted:
+      -- FTS column order is positional and every weight in `CatalogReader.search` names an index.
+      title             TEXT
     );
 
     -- Identity, not path, is the primary key of a photograph. Two files that swap names inside one
@@ -130,7 +133,11 @@ public enum Schema {
       byte_size    INTEGER NOT NULL DEFAULT 0,
       trashed_ns   INTEGER NOT NULL,
       restored_ns  INTEGER,
-      restore_err  TEXT
+      restore_err  TEXT,
+      -- v4: when a backup finished, and the stat hash the file had afterwards. Revert is refused when the
+      -- file has changed since, because reverting would undo someone else's edit.
+      completed_ns     INTEGER,
+      result_stat_hash INTEGER
     );
     CREATE INDEX ledger_media ON trash_ledger(media_id);
     CREATE INDEX ledger_state ON trash_ledger(state, trashed_ns DESC);
@@ -313,33 +320,35 @@ public enum Schema {
     -- Two derived columns since v3. `search_tags` and `search_ocr` carry a curated judgement and a noisy
     -- transcription respectively, which is why they rank differently from the file's own vocabulary.
     CREATE VIRTUAL TABLE media_fts USING fts5(
-      name, place_key, device, lens, search_text, search_tags, search_ocr,
+      name, place_key, device, lens, search_text, search_tags, search_ocr, title,
       content='media', content_rowid='id',
       tokenize='porter unicode61 remove_diacritics 2'
     );
 
     CREATE TRIGGER media_fts_ai AFTER INSERT ON media BEGIN
-      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr)
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr,
+                            title)
       VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
-              new.search_ocr);
+              new.search_ocr, new.title);
     END;
 
     CREATE TRIGGER media_fts_ad AFTER DELETE ON media BEGIN
       INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
-                            search_ocr)
+                            search_ocr, title)
       VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
-              old.search_tags, old.search_ocr);
+              old.search_tags, old.search_ocr, old.title);
     END;
 
     CREATE TRIGGER media_fts_au AFTER UPDATE OF name, place_key, device, lens, search_text, search_tags,
-                                             search_ocr ON media BEGIN
+                                             search_ocr, title ON media BEGIN
       INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
-                            search_ocr)
+                            search_ocr, title)
       VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
-              old.search_tags, old.search_ocr);
-      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr)
+              old.search_tags, old.search_ocr, old.title);
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr,
+                            title)
       VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
-              new.search_ocr);
+              new.search_ocr, new.title);
     END;
     """
 

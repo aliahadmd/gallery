@@ -8,10 +8,19 @@ public typealias AddFoldersAction = @MainActor () async -> Void
 public struct RootView: View {
     private let model: MediaLibraryModel
     private let addFolders: AddFoldersAction
+    private let exportEditor: EditorExportAction?
+    private let exportCollage: CollageExportAction?
 
-    public init(model: MediaLibraryModel, addFolders: @escaping AddFoldersAction) {
+    public init(
+        model: MediaLibraryModel,
+        addFolders: @escaping AddFoldersAction,
+        exportEditor: EditorExportAction? = nil,
+        exportCollage: CollageExportAction? = nil
+    ) {
         self.model = model
         self.addFolders = addFolders
+        self.exportEditor = exportEditor
+        self.exportCollage = exportCollage
     }
 
     public var body: some View {
@@ -23,8 +32,22 @@ public struct RootView: View {
                 ViewerView(model: model)
                     .zIndex(1)
             }
+            // The editor sits above the viewer: opening it from the viewer keeps the photo behind it, so
+            // closing the editor returns to the same picture rather than to the grid.
+            if let session = model.editingSession {
+                EditorView(model: model, session: session, exportCopy: exportEditor)
+                    .zIndex(2)
+            }
+            // A collage is its own surface: several photos, one document, and a template rather than a
+            // recipe. It sits above the editor so opening one from the grid never hides behind the other.
+            if let session = model.collageSession {
+                CollageView(model: model, session: session, exportCopy: exportCollage)
+                    .zIndex(3)
+            }
         }
         .animation(.easeOut(duration: 0.12), value: model.viewerID)
+        .animation(.easeOut(duration: 0.12), value: model.editorID)
+        .animation(.easeOut(duration: 0.12), value: model.isCollageOpen)
         .task { await model.start() }
         .onDisappear { model.stop() }
         .alert("Gallery", isPresented: hasNotice) {

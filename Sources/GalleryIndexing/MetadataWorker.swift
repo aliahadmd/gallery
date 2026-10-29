@@ -320,7 +320,7 @@ public actor MetadataWorker {
             }
         }
 
-        guard await write(writes) else {
+        guard let refused = await write(writes) else {
             // The rows are claimed and their `attempts` are bumped, so an unwritten batch is one that will be
             // claimed again. Nothing here needs rolling back — and nothing here may be settled.
             result.dropped = 1
@@ -331,6 +331,13 @@ public actor MetadataWorker {
         try? await catalog.completeWork(ids: retired)
         for note in noted {
             try? await catalog.failWork(id: note.queueID, error: note.message)
+        }
+        if !refused.isEmpty {
+            // The file changed between the decode and the write — an edit, or another app saving in place.
+            // The batch's queue entries are retired by now, so the rows go back in as fresh work rather than
+            // being counted as finished with stale values.
+            try? await catalog.raiseWorkPriority(mediaIDs: refused, priority: 1)
+            Log.indexing.error("pass B re-queued \(refused.count) rows that changed while being read")
         }
         for sourceID in sources {
             await publishSnapshot(sourceID)
@@ -349,20 +356,20 @@ public actor MetadataWorker {
 
     /// The one catalog write per hop, on the same lock ladder pass A uses: a second Gallery process holding
     /// the write lock is a reason to wait, and a batch that never landed stays queued instead of being lost.
-    private func write(_ rows: [MediaItem]) async -> Bool {
-        guard !rows.isEmpty else { return true }
+    /// Nil means the batch could not be written at all; otherwise the ids the stat-hash CAS refused.
+    private func write(_ rows: [MediaItem]) async -> [MediaID]? {
+        guard !rows.isEmpty else { return [] }
         var burned = 0
         while true {
             do {
-                try await catalog.recordMetadata(rows)
-                return true
+                return try await catalog.recordMetadata(rows)
             } catch let error as SQLiteError where error.isLockContention {
-                guard burned < LockBackoff.maximumAttempts else { return false }
+                guard burned < LockBackoff.maximumAttempts else { return nil }
                 burned += 1
                 try? await Task.sleep(for: LockBackoff.delay(afterAttempt: burned - 1) + LockBackoff.jitter())
             } catch {
                 Log.indexing.error("pass B metadata write failed: \(error, privacy: .public)")
-                return false
+                return nil
             }
         }
     }

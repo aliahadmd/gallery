@@ -46,6 +46,16 @@ public struct ViewerView: View {
             .focusEffectDisabled()
             .onAppear { isFocused = true }
             .onChange(of: model.viewerID) { _, _ in resetMedia() }
+            .onChange(of: model.editorID) { _, editorID in
+                // A slideshow behind the editor would swap the photo the session describes; the editor owns
+                // the keyboard while it is open, and gives it back when it closes.
+                if editorID != nil {
+                    isSlideshow = false
+                    isFocused = false
+                } else {
+                    isFocused = true
+                }
+            }
             .onKeyPress(.leftArrow) {
                 isSlideshow = false
                 Task { await model.stepViewer(by: -1) }
@@ -63,6 +73,11 @@ public struct ViewerView: View {
             .onKeyPress(KeyEquivalent("s")) {
                 guard model.viewerItem?.kind == .image else { return .ignored }
                 isSlideshow.toggle()
+                return .handled
+            }
+            .onKeyPress(KeyEquivalent("e")) {
+                guard model.viewerItem?.kind == .image, let id = model.viewerID else { return .ignored }
+                Task { await model.openEditor(id) }
                 return .handled
             }
             .onKeyPress(.upArrow) { setZoom(zoom * 1.25); return .handled }
@@ -147,6 +162,12 @@ public struct ViewerView: View {
                     }
                     .buttonStyle(.plain)
                     .help(isSlideshow ? "Stop the slideshow (S)" : "Start a slideshow (S)")
+
+                    Button { Task { await model.openEditor(item.id) } } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Edit a copy (E)")
                 }
 
                 if let index = model.items.firstIndex(where: { $0.id == item.id }) {

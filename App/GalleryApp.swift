@@ -36,9 +36,13 @@ struct GalleryApp: App {
     /// photos" and "the catalog is unreadable" is the whole point of telling the user.
     @ViewBuilder private var content: some View {
         if let model = container.model {
-            RootView(model: model) {
+            RootView(model: model, addFolders: {
                 await FolderPicker.present(into: model)
-            }
+            }, exportEditor: { session in
+                await ExportPicker.presentEditorExport(for: session, into: model)
+            }, exportCollage: { session in
+                await ExportPicker.presentCollageExport(for: session, into: model)
+            })
             // The other half of the `public.folder` document type in Info.plist: a folder opened in
             // Finder's Open With, or dropped on the dock icon, arrives here already granted to the sandbox.
             .onOpenURL { url in
