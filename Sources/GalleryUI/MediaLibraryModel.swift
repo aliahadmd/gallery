@@ -154,6 +154,9 @@ public final class MediaLibraryModel {
             let resolved = try await coordinator.resolveSources()
             for source in resolved where !source.bookmarkState.blocksScanning && source.isIncluded {
                 await coordinator.startScan(source.id)
+                // A folder that is being scanned is also a folder worth watching: the scan covers what is
+                // there now, the watcher covers what the user drops in ten seconds later.
+                await coordinator.startWatching(source.id)
             }
         } catch {
             notices.append(Notice("Could not reopen the library.", detail: "\(error)"))
@@ -188,7 +191,9 @@ public final class MediaLibraryModel {
         // rather than being cut off. The worker stops claiming new rows here either way.
         let worker = passB
         let cache = thumbnails
+        let walk = coordinator
         Task {
+            await walk.stopAllWatching()
             await worker.cancel()
             await cache.clearWindow()
         }
@@ -218,7 +223,9 @@ public final class MediaLibraryModel {
         do {
             let source = try await coordinator.addFolder(url)
             selection = .folder(source.id)
+            await coordinator.startWatching(source.id)
             await refreshSources()
+            await refreshAlbums()
             await reload()
         } catch {
             notices.append(Notice("Could not add “\(url.lastPathComponent)”.", detail: "\(error)"))
@@ -240,6 +247,7 @@ public final class MediaLibraryModel {
 
     public func remove(_ source: FolderSource) async {
         do {
+            await coordinator.stopWatching(source.id)
             try await coordinator.removeSource(source.id)
             if case .folder(let id) = selection, id == source.id { selection = .all }
             if case .subfolder(let id, _) = selection, id == source.id { selection = .all }

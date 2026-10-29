@@ -315,6 +315,36 @@ struct CoordinatorTests {
         #expect(second.failure != nil, "a second scan of the same folder is refused, not queued")
         #expect(second.written == 0, "the refused scan must not have touched the catalog")
     }
+
+    @Test("A file dropped into a watched folder reaches the catalog without a manual rescan")
+    func watcherRescansOnChange() async throws {
+        let library = try await CoordinatorFixture(
+            configuration: Configuration(watchLatency: 0.1, watchDebounce: .milliseconds(200))
+        )
+        defer { library.tearDown() }
+        let tree = try FixtureTree()
+        defer { tree.cleanup() }
+        try tree.file("first.jpg")
+
+        let source = try await library.coordinator.addFolder(tree.root, scanning: false)
+        _ = await library.coordinator.scan(source.id)
+        #expect(try await library.reader.count(album: .folder(source.id)) == 1)
+        await library.coordinator.startWatching(source.id)
+
+        try tree.file("dropped.jpg")
+
+        let clock = SuspendingClock()
+        let deadline = clock.now.advanced(by: .seconds(15))
+        var count = 0
+        while clock.now < deadline {
+            count = (try? await library.reader.count(album: .folder(source.id))) ?? 0
+            if count == 2 { break }
+            try await clock.sleep(for: .milliseconds(100))
+        }
+        await library.coordinator.stopAllWatching()
+
+        #expect(count == 2, "the watcher's rescan has to find the new file")
+    }
 }
 
 private extension Sequence where Element == Int {

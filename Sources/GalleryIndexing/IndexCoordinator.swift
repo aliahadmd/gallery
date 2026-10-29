@@ -53,13 +53,22 @@ public actor IndexCoordinator {
         /// Parameter count per `DELETE … WHERE id IN (…)`; SQLite caps how many a statement may bind.
         public var sweepChunkRows: Int
         public var enumerator: Enumerator
+        /// Kernel-side coalescing for FSEvents, and the quiet period after the last event before a rescan.
+        /// Two knobs because they answer different questions: how fast the disk tells us, and how long we
+        /// wait for a burst (a folder copy) to finish before walking it.
+        public var watchLatency: TimeInterval
+        public var watchDebounce: Duration
 
         public init(batchRows: Int = 500, batchInterval: Duration = .milliseconds(200),
-                    sweepChunkRows: Int = 500, enumerator: Enumerator = Enumerator()) {
+                    sweepChunkRows: Int = 500, enumerator: Enumerator = Enumerator(),
+                    watchLatency: TimeInterval = 1.0,
+                    watchDebounce: Duration = .seconds(2)) {
             self.batchRows = max(1, batchRows)
             self.batchInterval = batchInterval
             self.sweepChunkRows = max(1, sweepChunkRows)
             self.enumerator = enumerator
+            self.watchLatency = watchLatency
+            self.watchDebounce = watchDebounce
         }
     }
 
@@ -73,6 +82,10 @@ public actor IndexCoordinator {
         var droppedBatches = 0
         var progress: IndexProgress
     }
+
+    private var watchers: [SourceID: FolderWatcher] = [:]
+    private var watcherRoots: [SourceID: URL] = [:]
+    private var watchDebounce: [SourceID: Task<Void, Never>] = [:]
 
     private let catalog: Catalog
     private let reader: CatalogReader
@@ -198,6 +211,49 @@ public actor IndexCoordinator {
 
     public func cancelScan(_ sourceID: SourceID) {
         jobs[sourceID]?.task?.cancel()
+    }
+
+    // MARK: - Watching
+
+    /// Watch a source the user has granted. Called after a successful resolve: a folder whose grant is gone
+    /// has no events to give, and a watcher on a path the sandbox refuses is a silent failure.
+    public func startWatching(_ sourceID: SourceID) async {
+        guard watchers[sourceID] == nil, let source = try? await reader.source(id: sourceID) else { return }
+        guard !source.bookmarkState.blocksScanning else { return }
+        let key = Self.bookmarkKey(volumeID: source.volumeID, path: source.rootPath)
+        guard case .valid(let root) = bookmarks.resolve(key) else { return }
+        // The stream reads the directory for as long as it runs, so the scope is held for that long.
+        SecurityScope.begin(root)
+        let watcher = FolderWatcher(path: root.path, latency: configuration.watchLatency) { [weak self] in
+            Task { await self?.observedChange(sourceID) }
+        }
+        watchers[sourceID] = watcher
+        watcherRoots[sourceID] = root
+        watcher.start()
+    }
+
+    public func stopWatching(_ sourceID: SourceID) {
+        watchDebounce[sourceID]?.cancel()
+        watchDebounce[sourceID] = nil
+        watchers[sourceID]?.stop()
+        watchers[sourceID] = nil
+        if let root = watcherRoots.removeValue(forKey: sourceID) { SecurityScope.end(root) }
+    }
+
+    public func stopAllWatching() {
+        for sourceID in Array(watchers.keys) { stopWatching(sourceID) }
+    }
+
+    /// One rescan per burst. A scan already running makes `startScan` refuse, which is exactly right: the
+    /// walk in flight will see the new files, and a second one would only race it.
+    private func observedChange(_ sourceID: SourceID) {
+        watchDebounce[sourceID]?.cancel()
+        watchDebounce[sourceID] = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: self.configuration.watchDebounce)
+            guard !Task.isCancelled else { return }
+            await self.startScan(sourceID)
+        }
     }
 
     /// Pausing stalls the consumer, which backs the walk up through its bounded stream rather than
