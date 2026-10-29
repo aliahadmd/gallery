@@ -57,22 +57,22 @@ final class Fixture {
         defaults = try #require(UserDefaults(suiteName: suiteName))
         let bookmarks = BookmarkStore(defaults: defaults)
         let walk = IndexCoordinator(catalog: catalog, reader: reader, bookmarks: bookmarks)
-        let pipeline = Self.pipeline(under: home, catalog: catalog, reader: reader, bookmarks: bookmarks)
+        let resolver = CatalogMediaResolver(reader: reader, bookmarks: bookmarks)
+        let pipeline = Self.pipeline(under: home, catalog: catalog, reader: reader, resolver: resolver)
         coordinator = walk
         model = MediaLibraryModel(reader: reader, coordinator: walk, passB: pipeline.worker,
-                                  thumbnails: pipeline.thumbnails, catalog: catalog)
+                                  thumbnails: pipeline.thumbnails, catalog: catalog, resolver: resolver)
         drains.append(pipeline.worker)
     }
 
     /// Pass B and the cache it writes through, built the way the app builds them: the walk's bookmarks, a
     /// thumbnail cache inside the fixture's own directory, and the same reader the grid pages through.
     private static func pipeline(under home: URL, catalog: Catalog, reader: CatalogReader,
-                                 bookmarks: BookmarkStore) -> (worker: MetadataWorker,
-                                                               thumbnails: ThumbnailService) {
+                                 resolver: CatalogMediaResolver) -> (worker: MetadataWorker,
+                                                                     thumbnails: ThumbnailService) {
         let cache = home.appendingPathComponent("thumbs", isDirectory: true)
         let store = ThumbnailStore(layout: ThumbnailLayout(root: cache),
                                    byteLimit: ThumbnailStore.byteLimit(for: cache))
-        let resolver = CatalogMediaResolver(reader: reader, bookmarks: bookmarks)
         let thumbnails = ThumbnailService(catalog: catalog, store: store, resolver: resolver)
         return (MetadataWorker(catalog: catalog, reader: reader, resolver: resolver,
                                thumbnails: thumbnails), thumbnails)
@@ -84,12 +84,13 @@ final class Fixture {
         let secondCatalog = try Catalog.open(at: database)
         let secondReader = try CatalogReader.open(at: database)
         let second = IndexCoordinator(catalog: secondCatalog, reader: secondReader, bookmarks: bookmarks)
+        let secondResolver = CatalogMediaResolver(reader: secondReader, bookmarks: bookmarks)
         let pipeline = Self.pipeline(under: directory, catalog: secondCatalog, reader: secondReader,
-                                     bookmarks: bookmarks)
+                                     resolver: secondResolver)
         drains.append(pipeline.worker)
         return Relaunch(model: MediaLibraryModel(reader: secondReader, coordinator: second,
                                                  passB: pipeline.worker, thumbnails: pipeline.thumbnails,
-                                                 catalog: secondCatalog),
+                                                 catalog: secondCatalog, resolver: secondResolver),
                         coordinator: second)
     }
 
@@ -470,5 +471,43 @@ final class Fixture {
         await fixture.model.toggleFavorite(item.id)
         #expect(try await fixture.reader.item(id: item.id)?.isFavorite == false)
         #expect(try await fixture.reader.count(album: .favorites) == 0)
+    }
+
+    @Test("Closing the viewer stops the clip, not just the window")
+    func closingViewerStopsTheClip() async throws {
+        let fixture = try await Fixture(files: 6)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        let clip = try #require(fixture.model.items.first { $0.kind == .video })
+        fixture.model.openViewer(clip.id)
+        let lease = try #require(await fixture.model.videoLease(for: clip))
+        #expect(lease.player.currentItem != nil)
+
+        fixture.model.closeViewer()
+        #expect(lease.player.currentItem == nil, "closing the viewer pauses and empties the pooled player")
+    }
+
+    @Test("Stepping from a clip to a photo stops the clip")
+    func steppingToAPhotoStopsTheClip() async throws {
+        let fixture = try await Fixture(files: 6)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        let items = fixture.model.items
+        // The page's own order decides which clip is followed by a photo; find such a pair rather than
+        // assuming the fixture's file names survive sorting.
+        let index = try #require(items.indices.dropLast().first {
+            items[$0].kind == .video && items[$0 + 1].kind == .image
+        })
+        fixture.model.openViewer(items[index].id)
+        let lease = try #require(await fixture.model.videoLease(for: items[index]))
+
+        await fixture.model.stepViewer(by: 1)
+
+        #expect(fixture.model.viewerItem?.id == items[index + 1].id)
+        #expect(lease.player.currentItem == nil, "the clip that left the screen was torn down")
     }
 }

@@ -59,6 +59,9 @@ public final class MediaLibraryModel {
     private let passB: MetadataWorker
     private let thumbnails: ThumbnailService
     private let catalog: Catalog
+    /// The clips the viewer has open. Owned by the model rather than the view so a SwiftUI rebuild cannot
+    /// silently orphan a playing `AVPlayer`.
+    private let players: PlayerPool
     private var cursor: SortCursor?
     private var generation = 0
     private var feed: Task<Void, Never>?
@@ -70,12 +73,13 @@ public final class MediaLibraryModel {
     private var windowFlush: Task<Void, Never>?
 
     public init(reader: CatalogReader, coordinator: IndexCoordinator, passB: MetadataWorker,
-                thumbnails: ThumbnailService, catalog: Catalog) {
+                thumbnails: ThumbnailService, catalog: Catalog, resolver: any MediaResolving) {
         self.reader = reader
         self.coordinator = coordinator
         self.passB = passB
         self.thumbnails = thumbnails
         self.catalog = catalog
+        self.players = PlayerPool(resolver: resolver)
     }
 
     // MARK: - Lifecycle
@@ -140,6 +144,8 @@ public final class MediaLibraryModel {
     }
 
     public func stop() {
+        // Closing the window is the end of playback, and it must not wait for the drain to land a batch.
+        players.stopAll()
         feed?.cancel()
         feed = nil
         previewFeed?.cancel()
@@ -357,6 +363,9 @@ public final class MediaLibraryModel {
 
     public func closeViewer() {
         viewerID = nil
+        // A clip that is still decoding is a clip that will play its audio over the grid the moment it
+        // reaches a keyframe. Closing is the end of playback, not a pause the user has to find.
+        players.stopAll()
     }
 
     /// ←/→. Stops at the ends rather than wrapping — a viewer that jumps from the oldest photo to the newest
@@ -371,6 +380,22 @@ public final class MediaLibraryModel {
         guard next != landed else { return }
         self.viewerID = items[next].id
         selectedID = items[next].id
+        // Whatever the previous step opened is stopped before its layer is replaced.
+        players.evict(except: self.viewerID)
+    }
+
+    /// The clip's player, made on first ask and kept inside the pool's window.
+    public func videoLease(for item: MediaItem) async -> PlayerPool.Lease? {
+        await players.player(for: item)
+    }
+
+    /// Opens the next clip before the user asks for it, so one press of → does not pay a cold asset load.
+    public func preloadVideo(after item: MediaItem) async {
+        guard let index = items.firstIndex(where: { $0.id == item.id }),
+              index + 1 < items.count else { return }
+        let next = items[index + 1]
+        guard next.kind == .video else { return }
+        _ = await players.player(for: next)
     }
 
     /// The viewer's tier: one decode down to at most 2048 px, which a 1280-px camera file passes through

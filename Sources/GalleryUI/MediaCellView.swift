@@ -28,6 +28,17 @@ public struct MediaCellView: View {
                 ThumbnailView(item: item, model: model)
             }
 
+            // A poster is a still frame; without this a clip and a photo are the same picture in the grid.
+            // The layer stays out of cells on purpose — sixty live players die on the first scroll.
+            if item.kind == .video {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 24))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .shadow(color: .black.opacity(0.45), radius: 3)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+            }
+
             caption
         }
         .aspectRatio(cellRatio, contentMode: .fit)

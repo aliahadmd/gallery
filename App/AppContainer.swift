@@ -34,7 +34,7 @@ final class AppContainer {
                                         resolver: resolver, thumbnails: thumbnails)
 
             model = MediaLibraryModel(reader: reader, coordinator: coordinator, passB: worker,
-                                      thumbnails: thumbnails, catalog: catalog)
+                                      thumbnails: thumbnails, catalog: catalog, resolver: resolver)
             startupFailure = nil
         } catch {
             model = nil
