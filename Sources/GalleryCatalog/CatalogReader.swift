@@ -205,6 +205,41 @@ public actor CatalogReader {
         }
     }
 
+    /// Tag albums: one per curated slug that has enough photos to be a shelf row. The cover is the tag's
+    /// highest-aesthetic member, which is one index seek thanks to `media_tag_slug`.
+    public func tagAlbums(minimumItems threshold: Int = 3) throws -> [Album] {
+        try handle.query(AnalysisStatements.tagAlbums, [.integer(Int64(threshold))]).map { row in
+            let slug = try row.string(named: "slug")
+            let kind = AlbumKind.tag(TagKey(slug: slug))
+            return Album(
+                id: AlbumID(rawValue: Album.syntheticID(for: kind)),
+                kind: kind,
+                title: TagVocabulary.title(for: slug),
+                coverMediaID: try row.optionalInt64(named: "cover_id").map(MediaID.init(rawValue:)),
+                itemCount: Int(try row.int64(named: "item_count")),
+                sortKey: -Int64(try row.int64(named: "item_count"))
+            )
+        }
+    }
+
+    /// People, numbered until somebody names them. A name the user typed is never overwritten by a
+    /// re-cluster, which is why the title reads the row rather than recomputing from the auto index.
+    public func peopleAlbums(minimumFaces threshold: Int = 3) throws -> [Album] {
+        try handle.query(AnalysisStatements.peopleAlbums, [.integer(Int64(threshold))]).map { row in
+            let id = try row.int64(named: "id")
+            let autoIndex = Int(try row.int64(named: "auto_index"))
+            let kind = AlbumKind.person(PersonKey(stableID: id))
+            return Album(
+                id: AlbumID(rawValue: Album.syntheticID(for: kind)),
+                kind: kind,
+                title: try row.optionalString(named: "name") ?? "Person \(autoIndex)",
+                coverMediaID: try row.optionalInt64(named: "cover_media_id").map(MediaID.init(rawValue:)),
+                itemCount: Int(try row.int64(named: "face_count")),
+                sortKey: -Int64(try row.int64(named: "face_count"))
+            )
+        }
+    }
+
     // MARK: - Search
 
     public func search(
@@ -223,12 +258,18 @@ public actor CatalogReader {
         // is decided here rather than in SQL: `snippet` marks up only the terms that matched *its* column,
         // so the column carrying a marker is the column the user's words actually hit. A filename with a
         // literal bracket in it costs a preference, never a wrong row.
+        //
+        // Weights are positional since v3: name 10, place 5, device 3, lens 2, search_text 1, tags 4,
+        // OCR 2. A tag is a curated judgement; OCR is a transcription that contains "ok" and "cancel" on
+        // every screenshot, so it sits above the file's own vocabulary but well below a name.
         let rows = try handle.query(
             """
             SELECT \(CatalogRow.itemSelectList),
                    snippet(media_fts, 0, '[', ']', '…', 12) AS name_hit,
                    snippet(media_fts, 4, '[', ']', '…', 12) AS body_hit,
-                   bm25(media_fts, 10.0, 5.0, 3.0, 2.0, 1.0) AS rank
+                   snippet(media_fts, 5, '[', ']', '…', 12) AS tag_hit,
+                   snippet(media_fts, 6, '[', ']', '…', 12) AS text_hit,
+                   bm25(media_fts, 10.0, 5.0, 3.0, 2.0, 1.0, 4.0, 2.0) AS rank
             FROM media_fts
             JOIN media ON media.id = media_fts.rowid
             LEFT JOIN favorite ON favorite.media_id = media.id
@@ -241,9 +282,18 @@ public actor CatalogReader {
         return try rows.map { row in
             let nameHit = try row.optionalString(named: "name_hit") ?? ""
             let bodyHit = try row.optionalString(named: "body_hit") ?? ""
+            let tagHit = try row.optionalString(named: "tag_hit") ?? ""
+            let textHit = try row.optionalString(named: "text_hit") ?? ""
+            // Name first (the strongest evidence), then the recognised text, then the tag, then the file's
+            // own vocabulary. The first column carrying a marker is the one that actually matched.
+            let candidates: [(SearchColumn, String)] = [
+                (.name, nameHit), (.recognizedText, textHit), (.tag, tagHit), (.body, bodyHit),
+            ]
+            let hit = candidates.first { $0.1.contains("[") }
             return SearchHit(
                 item: try CatalogRow.item(row),
-                snippet: nameHit.contains("[") ? nameHit : (bodyHit.contains("[") ? bodyHit : nameHit),
+                snippet: hit?.1 ?? nameHit,
+                matched: hit?.0 ?? .name,
                 rank: try row.double(named: "rank")
             )
         }
@@ -270,14 +320,25 @@ public actor CatalogReader {
     }
 }
 
+/// Which column the query actually hit. A screenshot that matched on its recognised text and not its
+/// filename is confusing without it — the row "IMG_4821.jpg" would otherwise look like a false positive.
+public enum SearchColumn: String, Sendable, Hashable, Codable {
+    case name
+    case recognizedText
+    case tag
+    case body
+}
+
 public struct SearchHit: Sendable, Hashable {
     public var item: MediaItem
     public var snippet: String
+    public var matched: SearchColumn
     public var rank: Double
 
-    public init(item: MediaItem, snippet: String, rank: Double) {
+    public init(item: MediaItem, snippet: String, matched: SearchColumn = .name, rank: Double) {
         self.item = item
         self.snippet = snippet
+        self.matched = matched
         self.rank = rank
     }
 }
@@ -297,6 +358,10 @@ enum AlbumTitles {
         case .recentlyDeleted: "Recently Deleted"
         case .uncategorized: "Uncategorized"
         case .problems: "Problems"
+        case .tag(let key): TagVocabulary.title(for: key.slug)
+        case .person: "Person"
+        case .duplicates: "Duplicates"
+        case .duplicateGroup: "Duplicate Set"
         default: "Album"
         }
     }

@@ -185,6 +185,12 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
     public var addedAt: Date
     public var indexedAt: Date?
 
+    /// The analyser's aesthetic score, roughly −1…1, 0 when nothing has scored it. On the row rather than in
+    /// the analysis table because the cover queries and the aesthetic sort read it as a plain column.
+    public var aesthetic: Double
+    /// A screenshot, receipt or whiteboard: worth OCR, never worth being an album's cover.
+    public var isUtility: Bool
+
     public init(
         id: MediaID,
         identity: FileIdentity,
@@ -217,7 +223,9 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
         modificationDate: Date? = nil,
         creationDate: Date? = nil,
         addedAt: Date = Date(),
-        indexedAt: Date? = nil
+        indexedAt: Date? = nil,
+        aesthetic: Double = 0,
+        isUtility: Bool = false
     ) {
         self.id = id
         self.identity = identity
@@ -251,6 +259,8 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
         self.creationDate = creationDate
         self.addedAt = addedAt
         self.indexedAt = indexedAt
+        self.aesthetic = aesthetic
+        self.isUtility = isUtility
     }
 
     /// Cell aspect ratio, corrected for EXIF orientation so a portrait JPEG does not lay out landscape.

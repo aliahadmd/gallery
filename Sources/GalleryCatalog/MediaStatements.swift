@@ -41,6 +41,11 @@ enum MediaStatements {
       stage = CASE WHEN media.stat_hash <> excluded.stat_hash
                    THEN excluded.stage ELSE MAX(media.stage, excluded.stage) END,
       is_offline = excluded.is_offline,
+      -- A file whose bytes changed is a file neither pass has looked at: the analysis row is stale too.
+      analysis_stage = CASE WHEN media.stat_hash <> excluded.stat_hash
+                            THEN 0 ELSE media.analysis_stage END,
+      analysis_attempts = CASE WHEN media.stat_hash <> excluded.stat_hash
+                               THEN 0 ELSE media.analysis_attempts END,
       -- Every SET expression sees the pre-update row, so this compares against the *old* hash: a file
       -- that really changed clears the error the previous attempt recorded, one that merely got
       -- re-walked keeps the error pass B gave it.

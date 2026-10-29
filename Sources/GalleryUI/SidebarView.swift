@@ -184,6 +184,10 @@ extension AlbumKind {
         case .uncategorized: "Uncategorized"
         case .problems: "Problems"
         case .location: "Place"
+        case .tag(let key): TagVocabulary.title(for: key.slug)
+        case .person: "Person"
+        case .duplicates: "Duplicates"
+        case .duplicateGroup: "Duplicate Set"
         case .day, .month, .event, .place, .smart: "Album"
         }
     }

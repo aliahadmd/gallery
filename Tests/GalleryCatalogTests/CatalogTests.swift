@@ -367,11 +367,7 @@ struct CatalogTests {
         // claim index could not order by it. A second connection is what a relaunch is.
         let downgraded = try SQLiteHandle.open(path: fixture.databaseURL.path, kind: .readWrite)
         try downgraded.write {
-            try downgraded.exec("DROP INDEX queue_claim")
-            try downgraded.exec("ALTER TABLE scan_queue DROP COLUMN rank")
-            try downgraded.exec(
-                "CREATE INDEX queue_claim ON scan_queue(priority DESC, enqueued_ns ASC, id)"
-            )
+            try downgraded.downgradeToV1()
             try downgraded.setUserVersion(1)
         }
 

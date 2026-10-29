@@ -68,7 +68,9 @@ enum CatalogRow {
             modificationDate: try row.optionalInt64(named: "mtime_ns").map(Date.init(nanoseconds:)),
             creationDate: try row.optionalInt64(named: "ctime_ns").map(Date.init(nanoseconds:)),
             addedAt: Date(nanoseconds: try row.int64(named: "added_ns")),
-            indexedAt: nil
+            indexedAt: nil,
+            aesthetic: try row.double(named: "aesthetic"),
+            isUtility: try row.bool(named: "is_utility")
         )
     }
 
@@ -149,6 +151,18 @@ enum CatalogRow {
         )
     }
 
+    static func analysisJob(_ row: Row) throws -> AnalysisJob {
+        AnalysisJob(
+            mediaID: MediaID(rawValue: try row.int64(named: "id")),
+            sourceID: SourceID(rawValue: try row.int64(named: "src_id")),
+            kind: MediaKind(rawValue: Int16(truncatingIfNeeded: try row.int64(named: "kind"))) ?? .unknown,
+            subtype: MediaSubtype(rawValue: Int32(truncatingIfNeeded: try row.int64(named: "subtype"))),
+            relativePath: try row.string(named: "rel_path"),
+            modificationDate: try row.optionalInt64(named: "mtime_ns").map(Date.init(nanoseconds:)),
+            dayBucket: Int32(truncatingIfNeeded: try row.int64(named: "cap_day"))
+        )
+    }
+
     static func workItem(_ row: Row) throws -> WorkItem {
         WorkItem(
             queueID: try row.int64(named: "id"),
@@ -169,10 +183,19 @@ enum CatalogRow {
                          queueID: try row.int64(named: "id"))
     }
 
-    /// Every column a media query must select. Keeping it in one constant is what makes the decode above
-    /// total: a new column is added once, and every reader picks it up.
+    /// Every column a media query must select. Explicit rather than `media.*` since v3: `search_ocr` can be
+    /// four kilobytes a row, and a 200-row page that drags it through `Row` for a `MediaItem` that cannot use
+    /// it is half a megabyte of copying per scroll. A column missing here is a decode error, not a silent
+    /// zero, so the list cannot rot without a test failing.
     static let itemSelectList = """
-    media.*, CASE WHEN favorite.media_id IS NULL THEN 0 ELSE 1 END AS is_favorite
+    media.id, media.src_id, media.rel_path, media.parent_rel, media.name, media.ext, media.volume_id,
+    media.doc_id, media.res_id, media.stat_hash, media.size_bytes, media.mtime_ns, media.ctime_ns,
+    media.added_ns, media.uttype, media.kind, media.subtype, media.stage, media.err_code,
+    media.px_w, media.px_h, media.orientation, media.color_space, media.duration_us, media.codec,
+    media.cap_utc, media.cap_wall, media.cap_tz, media.cap_src,
+    media.lat, media.lon, media.has_gps, media.place_key, media.cluster_id, media.device, media.lens,
+    media.search_text, media.is_offline, media.trash, media.aesthetic, media.is_utility,
+    CASE WHEN favorite.media_id IS NULL THEN 0 ELSE 1 END AS is_favorite
     """
 
     static let itemFrom = "FROM media LEFT JOIN favorite ON favorite.media_id = media.id"

@@ -5,7 +5,7 @@ import GallerySQLite
 /// can fail at runtime has no business standing between the app and its index.
 public enum Schema {
     /// Bump only together with an appended `Migration`.
-    public static let version: Int32 = 2
+    public static let version: Int32 = 3
 
     /// A fresh install gets this; an existing library gets `migrations` applied on top of its own version.
     public static let create = """
@@ -66,7 +66,17 @@ public enum Schema {
       meta_json     TEXT,
       search_text   TEXT,
       is_offline    INTEGER NOT NULL DEFAULT 0,
-      trash         INTEGER NOT NULL DEFAULT 0
+      trash         INTEGER NOT NULL DEFAULT 0,
+      -- Analysis (phase A). A stage of its own rather than a new IndexStage: `stage` gates pass A, pass B,
+      -- the progress fractions and the cover query, and none of those should learn about Vision.
+      analysis_stage    INTEGER NOT NULL DEFAULT 0,
+      analysis_attempts INTEGER NOT NULL DEFAULT 0,
+      aesthetic         REAL    NOT NULL DEFAULT 0,
+      is_utility        INTEGER NOT NULL DEFAULT 0,
+      -- Derived search text, owned by the analysis pass. Separate from `search_text` (which pass B rewrites
+      -- wholesale from the file's own vocabulary) so re-analysis is idempotent and rank weights differ.
+      search_tags       TEXT,
+      search_ocr        TEXT
     );
 
     -- Identity, not path, is the primary key of a photograph. Two files that swap names inside one
@@ -90,6 +100,13 @@ public enum Schema {
     CREATE INDEX media_trash        ON media(trash, id) WHERE trash <> 0;
     -- The pass-B work queue, as a partial index: 100k finished rows must not appear in it at all.
     CREATE INDEX media_pending      ON media(stage, src_id, id) WHERE stage < 3;
+
+    -- The analysis cursor. Claiming is the state transition (analysis_stage 0 -> 1), so there is no queue
+    -- table to keep in step with the rows it describes.
+    CREATE INDEX media_analysis_pending ON media(analysis_stage, stage, cap_day DESC, id DESC)
+      WHERE analysis_stage < 2 AND trash = 0;
+    CREATE INDEX media_aesthetic ON media(aesthetic DESC, id DESC);
+    CREATE INDEX media_folder_cover ON media(src_id, parent_rel, aesthetic DESC, id DESC);
 
     -- Favorites are a set of ids, not a column on the big table: toggling one must not rewrite a media
     -- row, and the upsert that follows a rename must not be able to lose one.
@@ -170,6 +187,84 @@ public enum Schema {
     );
     CREATE INDEX event_member_media ON event_member(media_id);
 
+    -- What the on-device analyser saw, and the stamp it saw it at. One row per photograph, not a versioned
+    -- history: analysis is the answer to "what is in this file", so changed bytes make the row pending again
+    -- rather than creating a second one.
+    CREATE TABLE media_analysis (
+      media_id       INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+      stat_hash      INTEGER NOT NULL,
+      version        INTEGER NOT NULL,
+      revision       TEXT    NOT NULL,
+      analyzed_ns    INTEGER NOT NULL,
+      labels_json    TEXT,
+      ocr_chars      INTEGER NOT NULL DEFAULT 0,
+      ocr_blocks     INTEGER NOT NULL DEFAULT 0,
+      ocr_accurate   INTEGER NOT NULL DEFAULT 0,
+      dhash          INTEGER,
+      print_revision INTEGER,
+      print_dims     INTEGER,
+      -- Kept only for rows that land in a duplicate group: a print is ~8 kB, and 100k of them would be
+      -- 800 MB of user storage for a decision that has already been made.
+      print_data     BLOB,
+      face_count     INTEGER NOT NULL DEFAULT 0,
+      frames         INTEGER NOT NULL DEFAULT 0
+    ) WITHOUT ROWID;
+
+    -- The album vocabulary. Denormalised aesthetic so one tag's cover is one index seek.
+    CREATE TABLE media_tag (
+      media_id  INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+      slug      TEXT    NOT NULL,
+      aesthetic REAL    NOT NULL DEFAULT 0,
+      PRIMARY KEY (media_id, slug)
+    ) WITHOUT ROWID;
+    CREATE INDEX media_tag_slug ON media_tag(slug, aesthetic DESC, media_id);
+
+    CREATE TABLE face_cluster (
+      id             INTEGER PRIMARY KEY,
+      revision       INTEGER NOT NULL,
+      name           TEXT,
+      auto_index     INTEGER NOT NULL DEFAULT 0,
+      centroid       BLOB    NOT NULL,
+      dims           INTEGER NOT NULL,
+      face_count     INTEGER NOT NULL DEFAULT 0,
+      cover_media_id INTEGER REFERENCES media(id) ON DELETE SET NULL,
+      cover_face_id  INTEGER,
+      hidden         INTEGER NOT NULL DEFAULT 0,
+      created_ns     INTEGER NOT NULL,
+      named_ns       INTEGER
+    );
+    CREATE INDEX face_cluster_people ON face_cluster(face_count DESC, id) WHERE hidden = 0;
+
+    CREATE TABLE face (
+      id          INTEGER PRIMARY KEY,
+      media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+      frame       INTEGER NOT NULL DEFAULT 0,
+      x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+      confidence  REAL NOT NULL DEFAULT 0,
+      quality     REAL NOT NULL DEFAULT 0,
+      embedding   BLOB    NOT NULL,
+      dims        INTEGER NOT NULL,
+      cluster_id  INTEGER REFERENCES face_cluster(id) ON DELETE SET NULL,
+      detected_ns INTEGER NOT NULL
+    );
+    CREATE INDEX face_media ON face(media_id);
+    CREATE INDEX face_by_cluster ON face(cluster_id) WHERE cluster_id IS NOT NULL;
+
+    CREATE TABLE duplicate_group (
+      id           INTEGER PRIMARY KEY,
+      member_count INTEGER NOT NULL DEFAULT 0,
+      best_id      INTEGER REFERENCES media(id) ON DELETE SET NULL,
+      created_ns   INTEGER NOT NULL,
+      updated_ns   INTEGER NOT NULL
+    );
+    CREATE TABLE duplicate_member (
+      group_id  INTEGER NOT NULL REFERENCES duplicate_group(id) ON DELETE CASCADE,
+      media_id  INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+      distance  INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (group_id, media_id)
+    );
+    CREATE INDEX duplicate_member_media ON duplicate_member(media_id);
+
     CREATE TABLE thumbnail_cache (
       media_id     INTEGER NOT NULL,
       bucket       INTEGER NOT NULL,
@@ -214,27 +309,37 @@ public enum Schema {
 
     -- External-content FTS5 kept in step by triggers rather than by application code: after a
     -- kill -9 mid-batch, the index is still consistent with the table it describes.
+    --
+    -- Two derived columns since v3. `search_tags` and `search_ocr` carry a curated judgement and a noisy
+    -- transcription respectively, which is why they rank differently from the file's own vocabulary.
     CREATE VIRTUAL TABLE media_fts USING fts5(
-      name, place_key, device, lens, search_text,
+      name, place_key, device, lens, search_text, search_tags, search_ocr,
       content='media', content_rowid='id',
       tokenize='porter unicode61 remove_diacritics 2'
     );
 
     CREATE TRIGGER media_fts_ai AFTER INSERT ON media BEGIN
-      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text)
-      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text);
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr)
+      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
+              new.search_ocr);
     END;
 
     CREATE TRIGGER media_fts_ad AFTER DELETE ON media BEGIN
-      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text)
-      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text);
+      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
+                            search_ocr)
+      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
+              old.search_tags, old.search_ocr);
     END;
 
-    CREATE TRIGGER media_fts_au AFTER UPDATE OF name, place_key, device, lens, search_text ON media BEGIN
-      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text)
-      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text);
-      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text)
-      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text);
+    CREATE TRIGGER media_fts_au AFTER UPDATE OF name, place_key, device, lens, search_text, search_tags,
+                                             search_ocr ON media BEGIN
+      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
+                            search_ocr)
+      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
+              old.search_tags, old.search_ocr);
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr)
+      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
+              new.search_ocr);
     END;
     """
 

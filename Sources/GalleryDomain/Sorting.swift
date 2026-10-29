@@ -7,6 +7,9 @@ public enum SortField: String, Sendable, Hashable, Codable, CaseIterable {
     case byteSize
     case pixelCount
     case duration
+    /// Phase A: best shot first. Unscored rows carry 0, which lands them at the end of a descending sort
+    /// inside the band of legitimately mediocre photographs rather than in a NULL heap.
+    case aesthetic
 
     /// A closed set of expressions: the sort API never accepts a column name from a caller, which is what
     /// lets `AlbumQuery` place this into SQL as text rather than as a (impossible) parameter binding.
@@ -18,6 +21,7 @@ public enum SortField: String, Sendable, Hashable, Codable, CaseIterable {
         case .byteSize: "size_bytes"
         case .pixelCount: "COALESCE(px_w, 0) * COALESCE(px_h, 0)"
         case .duration: "COALESCE(duration_us, 0)"
+        case .aesthetic: "aesthetic"
         }
     }
 }

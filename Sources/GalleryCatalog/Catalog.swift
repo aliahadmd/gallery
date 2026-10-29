@@ -14,12 +14,135 @@ public enum CatalogMigrations {
         // appends, which is why `rank` sits at the end of the v1 script too. The claim index is rebuilt
         // because the old one cannot answer an ordering that includes it.
         Migration(version: 2, name: "v2 recency rank in the work queue", up: { try $0.exec(Self.v2) }),
+        // v3 is the analysis phase: derived columns on `media`, the result tables, and an FTS index that
+        // covers the two new searchable columns. The virtual table cannot be altered, so it is replaced and
+        // `Catalog.open` rebuilds it after the step lands.
+        Migration(version: 3, name: "v3 analysis results and derived search columns",
+                  up: { try $0.exec(Self.v3) }),
     ]
 
     private static let v2 = """
     ALTER TABLE scan_queue ADD COLUMN rank INTEGER NOT NULL DEFAULT 0;
     DROP INDEX queue_claim;
     CREATE INDEX queue_claim ON scan_queue(priority DESC, rank DESC, enqueued_ns ASC, id);
+    """
+
+    /// Must leave `media` with the same columns, in the same order, as `Schema.create`.
+    private static let v3 = """
+    ALTER TABLE media ADD COLUMN analysis_stage    INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE media ADD COLUMN analysis_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE media ADD COLUMN aesthetic         REAL    NOT NULL DEFAULT 0;
+    ALTER TABLE media ADD COLUMN is_utility        INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE media ADD COLUMN search_tags       TEXT;
+    ALTER TABLE media ADD COLUMN search_ocr        TEXT;
+
+    CREATE INDEX media_analysis_pending ON media(analysis_stage, stage, cap_day DESC, id DESC)
+      WHERE analysis_stage < 2 AND trash = 0;
+    CREATE INDEX media_aesthetic ON media(aesthetic DESC, id DESC);
+    CREATE INDEX media_folder_cover ON media(src_id, parent_rel, aesthetic DESC, id DESC);
+
+    CREATE TABLE media_analysis (
+      media_id       INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+      stat_hash      INTEGER NOT NULL,
+      version        INTEGER NOT NULL,
+      revision       TEXT    NOT NULL,
+      analyzed_ns    INTEGER NOT NULL,
+      labels_json    TEXT,
+      ocr_chars      INTEGER NOT NULL DEFAULT 0,
+      ocr_blocks     INTEGER NOT NULL DEFAULT 0,
+      ocr_accurate   INTEGER NOT NULL DEFAULT 0,
+      dhash          INTEGER,
+      print_revision INTEGER,
+      print_dims     INTEGER,
+      print_data     BLOB,
+      face_count     INTEGER NOT NULL DEFAULT 0,
+      frames         INTEGER NOT NULL DEFAULT 0
+    ) WITHOUT ROWID;
+
+    CREATE TABLE media_tag (
+      media_id  INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+      slug      TEXT    NOT NULL,
+      aesthetic REAL    NOT NULL DEFAULT 0,
+      PRIMARY KEY (media_id, slug)
+    ) WITHOUT ROWID;
+    CREATE INDEX media_tag_slug ON media_tag(slug, aesthetic DESC, media_id);
+
+    CREATE TABLE face_cluster (
+      id             INTEGER PRIMARY KEY,
+      revision       INTEGER NOT NULL,
+      name           TEXT,
+      auto_index     INTEGER NOT NULL DEFAULT 0,
+      centroid       BLOB    NOT NULL,
+      dims           INTEGER NOT NULL,
+      face_count     INTEGER NOT NULL DEFAULT 0,
+      cover_media_id INTEGER REFERENCES media(id) ON DELETE SET NULL,
+      cover_face_id  INTEGER,
+      hidden         INTEGER NOT NULL DEFAULT 0,
+      created_ns     INTEGER NOT NULL,
+      named_ns       INTEGER
+    );
+    CREATE INDEX face_cluster_people ON face_cluster(face_count DESC, id) WHERE hidden = 0;
+
+    CREATE TABLE face (
+      id          INTEGER PRIMARY KEY,
+      media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+      frame       INTEGER NOT NULL DEFAULT 0,
+      x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+      confidence  REAL NOT NULL DEFAULT 0,
+      quality     REAL NOT NULL DEFAULT 0,
+      embedding   BLOB    NOT NULL,
+      dims        INTEGER NOT NULL,
+      cluster_id  INTEGER REFERENCES face_cluster(id) ON DELETE SET NULL,
+      detected_ns INTEGER NOT NULL
+    );
+    CREATE INDEX face_media ON face(media_id);
+    CREATE INDEX face_by_cluster ON face(cluster_id) WHERE cluster_id IS NOT NULL;
+
+    CREATE TABLE duplicate_group (
+      id           INTEGER PRIMARY KEY,
+      member_count INTEGER NOT NULL DEFAULT 0,
+      best_id      INTEGER REFERENCES media(id) ON DELETE SET NULL,
+      created_ns   INTEGER NOT NULL,
+      updated_ns   INTEGER NOT NULL
+    );
+    CREATE TABLE duplicate_member (
+      group_id  INTEGER NOT NULL REFERENCES duplicate_group(id) ON DELETE CASCADE,
+      media_id  INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+      distance  INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (group_id, media_id)
+    );
+    CREATE INDEX duplicate_member_media ON duplicate_member(media_id);
+
+    DROP TRIGGER media_fts_ai;
+    DROP TRIGGER media_fts_ad;
+    DROP TRIGGER media_fts_au;
+    DROP TABLE media_fts;
+    CREATE VIRTUAL TABLE media_fts USING fts5(
+      name, place_key, device, lens, search_text, search_tags, search_ocr,
+      content='media', content_rowid='id',
+      tokenize='porter unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER media_fts_ai AFTER INSERT ON media BEGIN
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr)
+      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
+              new.search_ocr);
+    END;
+    CREATE TRIGGER media_fts_ad AFTER DELETE ON media BEGIN
+      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
+                            search_ocr)
+      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
+              old.search_tags, old.search_ocr);
+    END;
+    CREATE TRIGGER media_fts_au AFTER UPDATE OF name, place_key, device, lens, search_text, search_tags,
+                                             search_ocr ON media BEGIN
+      INSERT INTO media_fts(media_fts, rowid, name, place_key, device, lens, search_text, search_tags,
+                            search_ocr)
+      VALUES ('delete', old.id, old.name, old.place_key, old.device, old.lens, old.search_text,
+              old.search_tags, old.search_ocr);
+      INSERT INTO media_fts(rowid, name, place_key, device, lens, search_text, search_tags, search_ocr)
+      VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
+              new.search_ocr);
+    END;
     """
 }
 

@@ -240,6 +240,7 @@ extension SortField {
         case .byteSize: "File Size"
         case .pixelCount: "Resolution"
         case .duration: "Duration"
+        case .aesthetic: "Aesthetic"
         }
     }
 }

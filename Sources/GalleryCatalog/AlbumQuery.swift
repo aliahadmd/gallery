@@ -53,6 +53,21 @@ public enum AlbumQuery {
             core = .init(whereSQL: "media.place_key = ?", arguments: [.text(placeKey.canonical)])
         case .smart(let rule):
             core = compile(rule: rule)
+        case .tag(let key):
+            core = .init(whereSQL: "media.id IN (SELECT media_id FROM media_tag WHERE slug = ?)",
+                         arguments: [.text(key.slug)])
+        case .person(let key):
+            core = .init(
+                whereSQL: "media.id IN (SELECT media_id FROM face WHERE cluster_id = ?)",
+                arguments: [.integer(key.stableID)]
+            )
+        case .duplicates:
+            core = .init(whereSQL: "media.id IN (SELECT media_id FROM duplicate_member)", arguments: [])
+        case .duplicateGroup(let key):
+            core = .init(
+                whereSQL: "media.id IN (SELECT media_id FROM duplicate_member WHERE group_id = ?)",
+                arguments: [.integer(key.stableID)]
+            )
         case .all:
             core = .init(whereSQL: "1", arguments: [])
         case .allPhotos:
@@ -179,6 +194,14 @@ public enum AlbumQuery {
             return .init(whereSQL: "media.cluster_id = ?", arguments: [.integer(value.intValue ?? 0)])
         case .byteSizeAtLeast:
             return .init(whereSQL: "media.size_bytes >= ?", arguments: [.integer(value.intValue ?? 0)])
+        case .aestheticAtLeast:
+            return .init(whereSQL: "media.aesthetic >= ?", arguments: [.real(value.doubleValue ?? 0)])
+        case .isUtility:
+            return .init(whereSQL: "media.is_utility = ?",
+                         arguments: [.integer((value.boolValue ?? true) ? 1 : 0)])
+        case .tagEquals:
+            return .init(whereSQL: "media.id IN (SELECT media_id FROM media_tag WHERE slug = ?)",
+                         arguments: [.text(value.textValue ?? "")])
         }
     }
 }

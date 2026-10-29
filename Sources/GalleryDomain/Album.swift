@@ -25,6 +25,29 @@ public struct PlaceKey: Sendable, Hashable, Codable {
     public var canonical: String { [name, adminArea, country].compactMap { $0 }.joined(separator: "|") }
 }
 
+/// A curated scene tag ("food", "documents", "night"). Closed vocabulary from `TagVocabulary`: the analyser
+/// maps Vision's identifiers onto it, so the shelf cannot fill up with 1,300 near-duplicates of "structure".
+public struct TagKey: Sendable, Hashable, Codable {
+    public var slug: String
+
+    public init(slug: String) { self.slug = slug }
+}
+
+/// A person from the face index. The stable id is what the sidebar selects; the name is whatever the user
+/// typed, and it survives a re-cluster.
+public struct PersonKey: Sendable, Hashable, Codable {
+    public var stableID: Int64
+
+    public init(stableID: Int64) { self.stableID = stableID }
+}
+
+/// A materialised near-duplicate set. Stable while the group lives.
+public struct DuplicateKey: Sendable, Hashable, Codable {
+    public var stableID: Int64
+
+    public init(stableID: Int64) { self.stableID = stableID }
+}
+
 public enum AlbumKind: Sendable, Hashable, Codable {
     case folder(SourceID)
     case subfolder(SourceID, relativePath: String)
@@ -34,6 +57,10 @@ public enum AlbumKind: Sendable, Hashable, Codable {
     case location(ClusterID)
     case place(PlaceKey)
     case smart(SmartRule)
+    case tag(TagKey)
+    case person(PersonKey)
+    case duplicates
+    case duplicateGroup(DuplicateKey)
 
     // The fixed type albums. These are also expressible as `smart`, but keeping named cases means the
     // sidebar's identity does not shift when someone edits a rule that happens to look the same.
@@ -53,7 +80,7 @@ public enum AlbumKind: Sendable, Hashable, Codable {
     /// Albums whose rows come from a materialized table rather than a predicate.
     public var isDerivedMembership: Bool {
         switch self {
-        case .event, .location, .place: true
+        case .event, .location, .place, .tag, .person, .duplicates, .duplicateGroup: true
         default: false
         }
     }
@@ -80,6 +107,11 @@ public enum PredicateKind: String, Sendable, Hashable, Codable, CaseIterable {
     case placeKeyEquals
     case clusterEquals
     case byteSizeAtLeast
+    /// Phase A: the analyser's score, so "best shots" is a rule like any other.
+    case aestheticAtLeast
+    /// Screenshots of chats and receipts: worth OCR, not worth a cover.
+    case isUtility
+    case tagEquals
 }
 
 public enum SmartValue: Sendable, Hashable, Codable {
