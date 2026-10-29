@@ -350,6 +350,17 @@ public final class MediaLibraryModel {
         }
     }
 
+    /// Explorer-level repair for a search index that has drifted: rebuild it from the media table. Cheap at
+    /// a few thousand rows, a second or two at a hundred thousand — offered as a menu item, never automatic.
+    public func rebuildSearchIndex() async {
+        do {
+            try await catalog.rebuildFTS()
+            notices.append(Notice("The search index was rebuilt."))
+        } catch {
+            notices.append(Notice("The search index could not be rebuilt.", detail: "\(error)"))
+        }
+    }
+
     /// Days and months are derived from pass B's capture dates, so a scan that just started is a sidebar
     /// with no dates in it yet — the feed refreshes these when a pass reports new rows.
     ///

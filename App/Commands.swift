@@ -44,6 +44,12 @@ struct GalleryCommands: Commands {
                 Task { await model.reanalyzeLibrary() }
             }
             .disabled(!model.hasAnalysis)
+
+            Divider()
+
+            Button("Rebuild Search Index") {
+                Task { await model.rebuildSearchIndex() }
+            }
         }
 
         CommandMenu("Photo") {            Button("Open") {

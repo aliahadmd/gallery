@@ -165,6 +165,24 @@ struct AnalysisTests {
         #expect(try await fixture.reader.search("invoice").isEmpty, "derived text is cleared")
     }
 
+    @Test("The search index can be rebuilt from the media table")
+    func searchIndexRebuilds() async throws {
+        let fixture = try await CatalogFixture()
+        defer { fixture.tearDown() }
+        let source = try await fixture.addSource()
+        let ids = try await fixture.record([makeItem("IMG_0001.JPG", documentID: 1, sourceID: source.id)])
+        let writer = try SQLiteHandle.open(path: fixture.databaseURL.path, kind: .readWrite)
+        try writer.exec("UPDATE media SET title = ? WHERE id = ?",
+                        [.text("Kyoto at dusk"), .integer(ids[0].rawValue)])
+        #expect(try await fixture.reader.search("kyoto").count == 1)
+
+        // Empty the index behind the triggers' back — the state a repair exists for.
+        try writer.exec("INSERT INTO media_fts(media_fts) VALUES ('delete-all')")
+        #expect(try await fixture.reader.search("kyoto").isEmpty)
+        try await fixture.catalog.rebuildFTS()
+        #expect(try await fixture.reader.search("kyoto").count == 1)
+    }
+
     private func columns(of url: URL, table: String) throws -> [String] {
         let handle = try SQLiteHandle.open(path: url.path, kind: .readOnly)
         return try handle.query("PRAGMA table_info(\(table))").compactMap { row in
