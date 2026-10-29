@@ -1,0 +1,454 @@
+import Foundation
+import CoreGraphics
+import Observation
+import GalleryDomain
+import GalleryCatalog
+import GalleryIndexing
+
+/// Something the user should be told about, once, in the UI rather than only in the log.
+public struct Notice: Identifiable, Sendable, Hashable {
+    public let id = UUID()
+    public var text: String
+    public var detail: String?
+
+    public init(_ text: String, detail: String? = nil) {
+        self.text = text
+        self.detail = detail
+    }
+}
+
+/// The view model behind the library window: the read side of the catalog, the coordinator's progress,
+/// and the keyset cursor the grid is paging with.
+///
+/// Every catalog hop is `await`ed against an actor, so scrolling, scanning and writing never share a
+/// thread with the render loop. The generation counter is the part that keeps that honest: two taps on the
+/// sidebar start two page loads, and the slower one must not win.
+@MainActor
+@Observable
+public final class MediaLibraryModel {
+    public private(set) var sources: [FolderSource] = []
+    public private(set) var items: [MediaItem] = []
+    public private(set) var selection: AlbumKind = .all
+    public private(set) var isLoadingPage = false
+    public private(set) var hasMorePages = false
+    public private(set) var rowCount = 0
+    public private(set) var progress: [SourceID: IndexProgress] = [:]
+    /// Pass B's numbers, kept apart from the walk's because they answer a different question: pass A says how
+    /// many files a folder holds, pass B says how many of them the grid has something to draw yet.
+    public private(set) var previews: [SourceID: IndexProgress] = [:]
+    public var notices: [Notice] = []
+
+    /// Set by the toolbar's sort menu. A `var` on purpose: it is the user's choice, not derived state.
+    public var sort: MediaSort = .default
+
+    /// The tile the user clicked, and the photo the viewer is showing. Both are ids rather than copied rows:
+    /// pass B fills in a pixel size minutes after a page lands, and a snapshot would leave the inspector
+    /// describing a row that no longer exists in that shape.
+    public private(set) var selectedID: MediaID?
+    public private(set) var viewerID: MediaID?
+    /// The trailing inspector. Open by default, because "what is this photo" is the question a gallery
+    /// exists to answer, not a power feature.
+    public var isInspectorPresented = true
+
+    /// Rows per page. 200 is roughly three screens of tiles, which is what makes the first page arrive
+    /// before the scan has listed the tenth directory.
+    private static let pageSize = 200
+
+    private let reader: CatalogReader
+    private let coordinator: IndexCoordinator
+    private let passB: MetadataWorker
+    private let thumbnails: ThumbnailService
+    private let catalog: Catalog
+    private var cursor: SortCursor?
+    private var generation = 0
+    private var feed: Task<Void, Never>?
+    private var previewFeed: Task<Void, Never>?
+    private var lastEmptyFill: SuspendingClock.Instant?
+    /// Which cells the grid has on screen. Membership rather than an ordered list, because the order the
+    /// service prefetches in is the order of `items` — the one thing a scroll gesture cannot get wrong.
+    private var visibleCells: Set<MediaID> = []
+    private var windowFlush: Task<Void, Never>?
+
+    public init(reader: CatalogReader, coordinator: IndexCoordinator, passB: MetadataWorker,
+                thumbnails: ThumbnailService, catalog: Catalog) {
+        self.reader = reader
+        self.coordinator = coordinator
+        self.passB = passB
+        self.thumbnails = thumbnails
+        self.catalog = catalog
+    }
+
+    // MARK: - Lifecycle
+
+    /// Relaunch path. Resolves the stored bookmarks first so a folder the user has to re-pick is badged
+    /// before the grid asks for it, then resumes the scan of everything still reachable.
+    public func start() async {
+        // Both feeds are attached before anything is set in motion, so a scan or a drain resuming in the next
+        // lines has somewhere to report to. Unwrapping `self` per iteration keeps a model the window closed
+        // from being held alive by its own feed.
+        let posterStream = await passB.progressFeed()
+        previewFeed = Task { [weak self] in
+            for await update in posterStream {
+                guard let self else { return }
+                let was = self.previews[update.sourceID]
+                self.previews[update.sourceID] = update
+                // A poster is a new fact about a row the grid already shows — its aspect ratio, its date, the
+                // text search can find — so the page has to be read again once the drain says it is done.
+                // Only on a change: a small folder's first and only frame can already be "finished", and a
+                // repeated frame of the same numbers is not a new answer worth throwing away a cursor for.
+                if update.phase == .finished, update != was {
+                    await self.reload()
+                }
+            }
+        }
+
+        let stream = await coordinator.progressFeed()
+        feed = Task { [weak self] in
+            for await update in stream {
+                guard let self else { return }
+                self.progress[update.sourceID] = update
+                if update.phase == .finished || update.phase == .failed {
+                    await self.refreshSources()
+                    await self.reload()
+                    // The walk just queued files pass B has never seen. If its previous drain ended with an
+                    // empty queue, nothing else would start another one.
+                    await self.passB.start()
+                } else if self.items.isEmpty && update.phase.isCounting && self.dueForEmptyFill() {
+                    // Pass A writes rows continuously, so an empty grid is not a finished answer while a
+                    // scan is running. Poll on a one-second beat until the first page exists; after that
+                    // scrolling drives the paging and the only refresh left is the one at the end.
+                    await self.reload()
+                }
+            }
+        }
+
+        // Pass B drains while pass A still walks: the queue it claims from is written before the rows are
+        // enqueued, so there is nothing half-made to read, and a folder the walk is still listing is a folder
+        // whose first pages could already have posters.
+        await passB.start()
+
+        do {
+            let resolved = try await coordinator.resolveSources()
+            for source in resolved where !source.bookmarkState.blocksScanning && source.isIncluded {
+                await coordinator.startScan(source.id)
+            }
+        } catch {
+            notices.append(Notice("Could not reopen the library.", detail: "\(error)"))
+        }
+        await refreshSources()
+        await reload()
+    }
+
+    public func stop() {
+        feed?.cancel()
+        feed = nil
+        previewFeed?.cancel()
+        previewFeed = nil
+        windowFlush?.cancel()
+        windowFlush = nil
+        // Not awaited: `stop` is the window's `onDisappear`, and a drain that is mid-decode lands its batch
+        // rather than being cut off. The worker stops claiming new rows here either way.
+        let worker = passB
+        let cache = thumbnails
+        Task {
+            await worker.cancel()
+            await cache.clearWindow()
+        }
+    }
+
+    /// One-second beat, monotonic so a clock change cannot stall the first page.
+    private func dueForEmptyFill() -> Bool {
+        let now = SuspendingClock.now
+        if let last = lastEmptyFill, now < last.advanced(by: .seconds(1)) { return false }
+        lastEmptyFill = now
+        return true
+    }
+
+    // MARK: - Sources
+
+    public func refreshSources() async {
+        sources = (try? await reader.sources()) ?? []
+    }
+
+    /// The folder picker's destination: grant, register, scan. Several at once, because the panel allows it
+    /// and one refused folder must not stop the others from registering.
+    public func add(_ urls: [URL]) async {
+        for url in urls { await add(url) }
+    }
+
+    public func add(_ url: URL) async {
+        do {
+            let source = try await coordinator.addFolder(url)
+            selection = .folder(source.id)
+            await refreshSources()
+            await reload()
+        } catch {
+            notices.append(Notice("Could not add “\(url.lastPathComponent)”.", detail: "\(error)"))
+        }
+    }
+
+    public func rescan(_ sourceID: SourceID) async {
+        await coordinator.startScan(sourceID)
+        await refreshSources()
+    }
+
+    /// ⌘R. Folders that lost their grant are skipped rather than retried — nothing the user can do from a
+    /// keyboard fixes a revoked permission, and a loop of doomed scans would look like a hang.
+    public func rescanAll() async {
+        for source in sources where !source.bookmarkState.blocksScanning && source.isIncluded {
+            await rescan(source.id)
+        }
+    }
+
+    public func remove(_ source: FolderSource) async {
+        do {
+            try await coordinator.removeSource(source.id)
+            if case .folder(let id) = selection, id == source.id { selection = .all }
+            if case .subfolder(let id, _) = selection, id == source.id { selection = .all }
+            progress[source.id] = nil
+            previews[source.id] = nil
+            await refreshSources()
+            await reload()
+        } catch {
+            notices.append(Notice("Could not remove “\(source.displayName)”.", detail: "\(error)"))
+        }
+    }
+
+    public func setPaused(_ sourceID: SourceID, _ paused: Bool) async {
+        await coordinator.setPaused(sourceID, paused)
+        if let snapshot = await coordinator.latestProgress().first(where: { $0.sourceID == sourceID }) {
+            progress[sourceID] = snapshot
+        }
+    }
+
+    public func cancelScan(_ sourceID: SourceID) async {
+        await coordinator.cancelScan(sourceID)
+    }
+
+    // MARK: - Paging
+
+    public func select(_ album: AlbumKind) async {
+        guard album != selection else { return }
+        selection = album
+        // The rows behind the viewer are about to be a different set; a selection that survived would be a
+        // photo the user can no longer see.
+        selectedID = nil
+        viewerID = nil
+        await reload()
+    }
+
+    /// Restart the cursor and fetch the first page.
+    public func reload() async {
+        generation += 1
+        let stamp = generation
+        cursor = nil
+        items = []
+        hasMorePages = false
+        isLoadingPage = true
+        defer { if stamp == generation { isLoadingPage = false } }
+
+        do {
+            rowCount = try await reader.count(album: selection)
+            let page = try await reader.page(album: selection, sort: sort, limit: Self.pageSize)
+            guard stamp == generation else { return }
+            items = page.items
+            cursor = page.nextCursor
+            hasMorePages = page.hasMore
+            // A fresh page can be a different set of rows, and a cell that left the album is not on screen
+            // just because SwiftUI kept its view alive. Without this the window keeps prefetching pictures
+            // the user switched away from.
+            let stillOnScreen = Set(page.items.map(\.id))
+            let leftTheAlbum = visibleCells.subtracting(stillOnScreen)
+            if !leftTheAlbum.isEmpty {
+                visibleCells = stillOnScreen.intersection(visibleCells)
+                scheduleWindowReport()
+            }
+        } catch {
+            guard stamp == generation else { return }
+            notices.append(Notice("This album could not be read.", detail: "\(error)"))
+        }
+    }
+
+    /// Called by the grid when the last visible cell is near the end of what is loaded.
+    public func loadMore() async {
+        guard hasMorePages, !isLoadingPage, let cursor else { return }
+        generation += 1
+        let stamp = generation
+        isLoadingPage = true
+        defer { if stamp == generation { isLoadingPage = false } }
+
+        do {
+            let page = try await reader.page(album: selection, sort: sort, after: cursor, limit: Self.pageSize)
+            guard stamp == generation else { return }
+            items.append(contentsOf: page.items)
+            self.cursor = page.nextCursor
+            hasMorePages = page.hasMore
+        } catch {
+            guard stamp == generation else { return }
+            notices.append(Notice("The next page could not be read.", detail: "\(error)"))
+        }
+    }
+
+    // MARK: - Cells
+
+    /// The picture for one cell, from the cheapest tier that holds it: memory, then the cache file, then a
+    /// decode. Nil is the answer for a file that cannot be drawn, and the cell keeps its placeholder.
+    public func preview(for item: MediaItem) async -> CGImage? {
+        await thumbnails.image(.init(item: item), bucket: .gridLarge)
+    }
+
+    /// The grid's `onAppear` for a tile. A flick across a thousand photos must cost one window report, not a
+    /// thousand, so the report waits for the scrolling to settle before it reaches the cache or the queue.
+    public func cellAppeared(_ item: MediaItem) {
+        guard visibleCells.insert(item.id).inserted else { return }
+        scheduleWindowReport()
+    }
+
+    public func cellDisappeared(_ item: MediaItem) {
+        guard visibleCells.remove(item.id) != nil else { return }
+        scheduleWindowReport()
+    }
+
+    private func scheduleWindowReport() {
+        windowFlush?.cancel()
+        windowFlush = Task { [weak self] in
+            try? await Task.sleep(for: Self.windowSettle)
+            guard !Task.isCancelled, let self else { return }
+            await self.reportWindow()
+        }
+    }
+
+    private func reportWindow() async {
+        let shown = items.filter { visibleCells.contains($0.id) }
+        await thumbnails.setWindow(shown.map { .init(item: $0) }, bucket: .gridLarge)
+        await passB.raisePriority(mediaIDs: shown.map(\.id))
+    }
+
+    /// A flick has to land on a picture, and a settled scroll reads like a flick to nothing but a timer.
+    /// Long enough that one gesture is one report, short enough that the decode lane starts on the row the
+    /// user stopped on before they have finished reading the tile they were looking at.
+    private static let windowSettle = Duration.milliseconds(120)
+
+    // MARK: - Selection and the viewer
+
+    /// The row the inspector is about, resolved against the page the grid is showing rather than remembered,
+    /// so pass B landing a pixel size updates the inspector along with the cell.
+    public var selectedItem: MediaItem? {
+        guard let selectedID else { return nil }
+        return items.first { $0.id == selectedID }
+    }
+
+    public var viewerItem: MediaItem? {
+        guard let viewerID else { return nil }
+        return items.first { $0.id == viewerID }
+    }
+
+    public func select(_ id: MediaID?) {
+        selectedID = id
+    }
+
+    /// Double-click, or Return on the selection. Selection follows the viewer, so closing it leaves the
+    /// inspector on the photo the user was just looking at.
+    public func openViewer(_ id: MediaID) {
+        guard items.contains(where: { $0.id == id }) else { return }
+        selectedID = id
+        viewerID = id
+    }
+
+    public func closeViewer() {
+        viewerID = nil
+    }
+
+    /// ←/→. Stops at the ends rather than wrapping — a viewer that jumps from the oldest photo to the newest
+    /// reads as a bug — and pulls the next page in when stepping past what is loaded.
+    public func stepViewer(by delta: Int) async {
+        guard let viewerID, let current = items.firstIndex(where: { $0.id == viewerID }) else { return }
+        if delta > 0, current == items.count - 1, hasMorePages {
+            await loadMore()
+        }
+        guard let landed = items.firstIndex(where: { $0.id == viewerID }) else { return }
+        let next = min(max(landed + delta, 0), items.count - 1)
+        guard next != landed else { return }
+        self.viewerID = items[next].id
+        selectedID = items[next].id
+    }
+
+    /// The viewer's tier: one decode down to at most 2048 px, which a 1280-px camera file passes through
+    /// untouched and a 48 MP frame pays for once and keeps on disk.
+    public func viewerImage(for item: MediaItem) async -> CGImage? {
+        await thumbnails.image(.init(item: item), bucket: .viewerFull)
+    }
+
+    public func toggleFavorite(_ id: MediaID) async {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        let wanted = !items[index].isFavorite
+        do {
+            try await catalog.setFavorite(id, wanted)
+            items[index].isFavorite = wanted
+        } catch {
+            notices.append(Notice("Could not change the favorite.", detail: "\(error)"))
+        }
+    }
+
+    // MARK: - Notices
+
+    public func dismissNotice() {
+        guard !notices.isEmpty else { return }
+        notices.removeFirst()
+    }
+
+    // MARK: - Derived view state
+
+    /// The folder a selection belongs to, for the header and the HUD.
+    public var sourceForSelection: FolderSource? {
+        let id: SourceID? = switch selection {
+        case .folder(let sourceID): sourceID
+        case .subfolder(let sourceID, _): sourceID
+        default: nil
+        }
+        guard let id else { return nil }
+        return sources.first { $0.id == id }
+    }
+
+    /// Progress worth drawing: a scan that is not finished, for the folder being looked at or for any
+    /// folder at all when the selection is a cross-library album.
+    ///
+    /// The two passes are merged rather than chosen between: while a walk is counting, its numbers are the
+    /// story ("4,000 files so far"), and once it is not, the drain's are ("400 of them have a poster yet").
+    /// Showing the walk's finished frame instead would call a folder ready while the grid is still blank.
+    public var activeProgress: IndexProgress? {
+        let sourceID = sourceForSelection?.id
+        var live = previews.values.filter { sourceID == nil || $0.sourceID == sourceID }
+        live.append(contentsOf: progress.values.filter {
+            $0.phase.isCounting && (sourceID == nil || $0.sourceID == sourceID)
+        })
+        return live.max { lhs, rhs in
+            if lhs.phase == rhs.phase { return lhs.discovered < rhs.discovered }
+            return lhs.phase.order < rhs.phase.order
+        }
+    }
+
+    /// Whether the HUD's pause and cancel mean what they say for this number. They belong to a folder's walk;
+    /// once that walk has ended, what is left on screen is the library-wide preview queue, which has no
+    /// single folder to stop.
+    public func canControlScan(_ progress: IndexProgress) -> Bool {
+        self.progress[progress.sourceID]?.phase.isCounting == true
+    }
+}
+
+extension IndexPhase {
+    /// Coarse ordering for "which of these two scans is further along" — the enum is a pipeline, not a set.
+    var order: Int {
+        switch self {
+        case .resolving: 0
+        case .enumerating: 1
+        case .sweeping: 2
+        case .readingMetadata: 3
+        case .deriving: 4
+        case .thumbnailing: 5
+        case .watching: 6
+        case .finished: 7
+        case .failed: -1
+        }
+    }
+}

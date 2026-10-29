@@ -1,0 +1,15 @@
+# Build output: SwiftPM scratch directories and the assembled app bundle.
+.build/
+.build-agent/
+build/
+
+# Xcode per-user state, if a project is ever added.
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+
+# Anything a local run leaves behind.
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
