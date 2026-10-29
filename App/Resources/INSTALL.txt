@@ -12,6 +12,19 @@ Gallery — install
    Then open it normally.
 5. Gallery reads your folders in place and uploads nothing. Add a folder with ⌘O.
 
+Finder
+------
+- Right-click a folder and choose Open With > Gallery. Gallery is an alternate
+  handler, so it never takes over as the default for folders.
+- Or right-click a folder and choose Services > Open Folder in Gallery. You can
+  give that a keyboard shortcut in System Settings > Keyboard > Keyboard Shortcuts
+  > Services.
+- For a top-level Finder item, make a Quick Action in Shortcuts: New Shortcut >
+  Receive Folders from Finder > Run Shell Script with
+      open -b app.gallery "$@"
+  then "Use as Quick Action". It appears in Finder's right-click menu under
+  Quick Actions.
+
 Updating
 --------
 Quit Gallery, replace the app with the new version, then re-add your folders

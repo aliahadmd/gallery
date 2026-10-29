@@ -49,6 +49,9 @@ codesign --force --sign "$IDENTITY" \
   --timestamp=none \
   "$APP"
 
+# Make Finder's Open With and Services see this build immediately instead of waiting for a launch.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
+
 echo "built  $APP"
 echo "sandbox entitlement present:"
 codesign -d --entitlements - "$APP" 2>&1 | grep -c "app-sandbox" || true

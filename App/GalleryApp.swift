@@ -4,6 +4,7 @@ import GalleryUI
 @main
 struct GalleryApp: App {
     @State private var container = AppContainer()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         // One window, not a `WindowGroup`: a second scene would run a second `model.start()` over the same
@@ -48,6 +49,8 @@ struct GalleryApp: App {
             .onOpenURL { url in
                 Task { await model.add(url) }
             }
+            // The Finder service needs the model; the window owns it, so hand it over once it exists.
+            .onAppear { appDelegate.model = model }
         } else {
             VStack(spacing: 10) {
                 Image(systemName: "externaldrive.badge.xmark")
