@@ -135,6 +135,31 @@ enum AnalysisStatements {
 
     static let renameCluster = "UPDATE face_cluster SET name = ?, named_ns = ? WHERE id = ?"
     static let hideCluster = "UPDATE face_cluster SET hidden = ? WHERE id = ?"
+
+    static let faceClusters = """
+    SELECT id, revision, centroid, dims, face_count FROM face_cluster WHERE hidden = 0
+    """
+
+    /// `OR IGNORE` because a face id is derived from (media, face index): a re-analysis of the same photo
+    /// lands on the same cluster instead of duplicating a person.
+    static let insertCluster = """
+    INSERT OR IGNORE INTO face_cluster (id, revision, centroid, dims, face_count, cover_media_id,
+                                        created_ns)
+    VALUES (?, ?, ?, ?, 1, ?, ?)
+    """
+
+    static let updateCluster = """
+    UPDATE face_cluster SET centroid = ?, face_count = ? WHERE id = ?
+    """
+}
+
+/// One stored person, as the index loads it.
+public struct FaceClusterRow: Sendable, Hashable {
+    public var id: Int64
+    public var revision: Int64
+    public var centroid: [Float]
+    public var dims: Int
+    public var faceCount: Int
 }
 
 extension Catalog {
@@ -259,8 +284,7 @@ extension Catalog {
         }
     }
 
-    public func renameFaceCluster(id: Int64, name: String?) throws {
-        try handle.write {
+    public func renameFaceCluster(id: Int64, name: String?) throws {        try handle.write {
             try handle.exec(AnalysisStatements.renameCluster,
                             [name.map(Value.text) ?? .null, .integer(Date().nanoseconds), .integer(id)])
         }
@@ -270,6 +294,53 @@ extension Catalog {
         try handle.write {
             try handle.exec(AnalysisStatements.hideCluster, [.integer(hidden ? 1 : 0), .integer(id)])
         }
+    }
+
+    public func faceClusters() throws -> [FaceClusterRow] {
+        try handle.query(AnalysisStatements.faceClusters).map { row in
+            FaceClusterRow(
+                id: try row.int64(named: "id"),
+                revision: try row.int64(named: "revision"),
+                centroid: Self.floats(from: try row.blob(named: "centroid") ?? []),
+                dims: Int(try row.int64(named: "dims")),
+                faceCount: Int(try row.int64(named: "face_count"))
+            )
+        }
+    }
+
+    public func insertFaceCluster(id: Int64, revision: Int64, centroid: [Float],
+                                  coverMediaID: MediaID?) throws {
+        try handle.write {
+            try handle.exec(AnalysisStatements.insertCluster, [
+                .integer(id),
+                .integer(revision),
+                Self.blob(of: centroid),
+                .integer(Int64(centroid.count)),
+                coverMediaID.map { .integer($0.rawValue) } ?? .null,
+                .integer(Date().nanoseconds),
+            ])
+        }
+    }
+
+    public func updateFaceCluster(id: Int64, centroid: [Float], faceCount: Int) throws {
+        try handle.write {
+            try handle.exec(AnalysisStatements.updateCluster, [
+                Self.blob(of: centroid), .integer(Int64(faceCount)), .integer(id),
+            ])
+        }
+    }
+
+    static func floats(from blob: [UInt8]) -> [Float] {
+        var values: [Float] = []
+        values.reserveCapacity(blob.count / 4)
+        var index = 0
+        while index + 4 <= blob.count {
+            let bits = UInt32(blob[index]) | UInt32(blob[index + 1]) << 8
+                | UInt32(blob[index + 2]) << 16 | UInt32(blob[index + 3]) << 24
+            values.append(Float(bitPattern: bits))
+            index += 4
+        }
+        return values
     }
 
     /// Float32 little-endian, the format Vision produces and the clusterer reads back.

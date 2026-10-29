@@ -18,11 +18,17 @@ public struct VisionAnalyzer: Sendable {
         public var ocrCharacterLimit: Int
         public var tagConfidence: Double
         public var maximumTags: Int
+        public var maximumFaces: Int
+        public var minimumFaceConfidence: Double
+        public var minimumFaceQuality: Double
+        public var minimumFaceArea: Double
         /// How long one file may take before the remaining steps are skipped and what is done is kept.
         public var itemBudget: Duration
 
         public init(maxPixel: Int32 = 1024, accuratePixel: Int32 = 2048, classificationLimit: Int = 8,
                     ocrCharacterLimit: Int = 4096, tagConfidence: Double = 0.35, maximumTags: Int = 4,
+                    maximumFaces: Int = 8, minimumFaceConfidence: Double = 0.4,
+                    minimumFaceQuality: Double = 0.2, minimumFaceArea: Double = 0.004,
                     itemBudget: Duration = .seconds(4)) {
             self.maxPixel = maxPixel
             self.accuratePixel = accuratePixel
@@ -30,6 +36,10 @@ public struct VisionAnalyzer: Sendable {
             self.ocrCharacterLimit = max(0, ocrCharacterLimit)
             self.tagConfidence = tagConfidence
             self.maximumTags = max(0, maximumTags)
+            self.maximumFaces = max(0, maximumFaces)
+            self.minimumFaceConfidence = minimumFaceConfidence
+            self.minimumFaceQuality = minimumFaceQuality
+            self.minimumFaceArea = minimumFaceArea
             self.itemBudget = itemBudget
         }
     }
@@ -42,6 +52,8 @@ public struct VisionAnalyzer: Sendable {
         public var aesthetic: Double
         public var isUtility: Bool
         public var dhash: UInt64
+        /// Boxes and embeddings; the cluster id is filled in by the face index, which is not Vision's job.
+        public var faces: [DetectedFace]
     }
 
     private let configuration: Configuration
@@ -105,6 +117,11 @@ public struct VisionAnalyzer: Sendable {
             }
         }
 
+        var faces: [DetectedFace] = []
+        if !expired() {
+            faces = detectFaces(in: frame)
+        }
+
         return Still(
             labels: labels,
             ocrText: AnalysisRules.normalizedOCR(lines, limit: configuration.ocrCharacterLimit),
@@ -112,8 +129,76 @@ public struct VisionAnalyzer: Sendable {
             ocrAccurate: accurate,
             aesthetic: aesthetic,
             isUtility: modelSaysUtility,
-            dhash: DHash.hash(frame)
+            dhash: DHash.hash(frame),
+            faces: faces
         )
+    }
+
+    /// Faces, with the quality Vision reports and a feature print per face.
+    ///
+    /// This SDK has no face-identity request, so the print is a general image descriptor taken over the face's
+    /// region with a little padding. That is enough to cluster one person's photos together; it is not a
+    /// recognition model, and the People shelf is built to be corrected by the user because of it.
+    private func detectFaces(in frame: CGImage) -> [DetectedFace] {
+        let request = VNDetectFaceCaptureQualityRequest()
+        guard (try? VNImageRequestHandler(cgImage: frame).perform([request])) != nil,
+              let observations = request.results else { return [] }
+
+        let eligible = observations
+            .filter { observation in
+                let box = observation.boundingBox
+                let area = Double(box.width * box.height)
+                let quality = Double(observation.faceCaptureQuality ?? 1)
+                return Double(observation.confidence) >= configuration.minimumFaceConfidence
+                    && area >= configuration.minimumFaceArea
+                    && quality >= configuration.minimumFaceQuality
+            }
+            .sorted { lhs, rhs in
+                Self.weight(of: lhs) > Self.weight(of: rhs)
+            }
+            .prefix(configuration.maximumFaces)
+
+        var faces: [DetectedFace] = []
+        for observation in eligible {
+            let print = VNGenerateImageFeaturePrintRequest()
+            print.regionOfInterest = Self.padded(observation.boundingBox)
+            guard (try? VNImageRequestHandler(cgImage: frame).perform([print])) != nil,
+                  let result = print.results?.first as? VNFeaturePrintObservation,
+                  let vector = Self.floats(from: result) else { continue }
+            let box = observation.boundingBox
+            let x = Double(box.origin.x)
+            let y = Double(box.origin.y)
+            let width = Double(box.width)
+            let height = Double(box.height)
+            let confidence = Double(observation.confidence)
+            let quality = Double(observation.faceCaptureQuality ?? 0.5)
+            faces.append(DetectedFace(
+                x: x, y: y, width: width, height: height,
+                confidence: confidence, quality: quality, embedding: vector
+            ))
+        }
+        return faces
+    }
+
+    private static func weight(of observation: VNFaceObservation) -> Double {
+        let box = observation.boundingBox
+        return Double(box.width * box.height) * Double(observation.confidence)
+    }
+
+    /// A face print from exactly the box is tight; a little background around it is what a person-recognition
+    /// model would see, and it makes two shots of one face more alike.
+    private static func padded(_ box: CGRect, by fraction: CGFloat = 0.2) -> CGRect {
+        let expanded = box.insetBy(dx: -box.width * fraction, dy: -box.height * fraction)
+        return expanded.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+
+    private static func floats(from observation: VNFeaturePrintObservation) -> [Float]? {
+        guard observation.elementType == .float,
+              observation.elementCount > 0,
+              observation.data.count >= observation.elementCount * 4 else { return nil }
+        var values = [Float](repeating: 0, count: observation.elementCount)
+        _ = values.withUnsafeMutableBytes { observation.data.copyBytes(to: $0) }
+        return values
     }
 
     private func textRequest(level: VNRequestTextRecognitionLevel) -> VNRecognizeTextRequest {

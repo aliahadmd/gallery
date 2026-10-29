@@ -7,6 +7,8 @@ import GalleryDomain
 public struct SidebarView: View {
     private let model: MediaLibraryModel
     @State private var daysExpanded = false
+    @State private var renamingPerson: Album?
+    @State private var newName = ""
 
     public init(model: MediaLibraryModel) {
         self.model = model
@@ -94,12 +96,61 @@ public struct SidebarView: View {
             // Present but empty on purpose: People slots into the navigation without moving anything when
             // face grouping arrives in a later version.
             Section("People") {
-                Text("Faces arrive in a later version.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if model.people.isEmpty {
+                    Text("Faces arrive in a later version.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.people) { album in
+                        dateRow(album, symbol: "person.crop.circle")
+                            .contextMenu {
+                                Button("Name Person…") {
+                                    renamingPerson = album
+                                    newName = ""
+                                }
+                                Button("Not a Person") {
+                                    Task { await model.hidePerson(album) }
+                                }
+                            }
+                    }
+                }
             }
         }
         .listStyle(.sidebar)
+        .sheet(item: $renamingPerson) { album in
+            renameSheet(album)
+        }
+    }
+
+    /// A person's name is a label on a cluster, not a fact about the photos: the copy says so, because a
+    /// wrong name on the wrong face is the one mistake this feature can make that the user must fix.
+    private func renameSheet(_ album: Album) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Name this person").font(.headline)
+            Text("“\(album.title)” keeps its photos. The name is yours, and re-analysis never overwrites it.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("Name", text: $newName)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 260)
+                .onSubmit { save(album) }
+            HStack {
+                Spacer()
+                Button("Cancel") { renamingPerson = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { save(album) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+    }
+
+    private func save(_ album: Album) {
+        let name = newName
+        renamingPerson = nil
+        Task { await model.renamePerson(album, to: name) }
     }
 
     private func tagSymbol(_ album: Album) -> String {

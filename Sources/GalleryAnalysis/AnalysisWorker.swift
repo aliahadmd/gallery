@@ -23,6 +23,7 @@ public actor AnalysisWorker {
         /// `MetadataWorker` — and so a test can open and close the gate deterministically.
         public var gate: (@Sendable () async -> Bool)?
         public var analyzer: VisionAnalyzer.Configuration
+        public var faces: FaceClusterer.Configuration
         public var pausedPollInterval: Duration
 
         public init(batchRows: Int = 32, maximumAttempts: Int = 2,
@@ -30,12 +31,14 @@ public actor AnalysisWorker {
                                                            semaphore: .vision()),
                     gate: (@Sendable () async -> Bool)? = nil,
                     analyzer: VisionAnalyzer.Configuration = .init(),
+                    faces: FaceClusterer.Configuration = .init(),
                     pausedPollInterval: Duration = .milliseconds(500)) {
             self.batchRows = max(1, batchRows)
             self.maximumAttempts = max(1, maximumAttempts)
             self.visionLane = visionLane
             self.gate = gate
             self.analyzer = analyzer
+            self.faces = faces
             self.pausedPollInterval = pausedPollInterval
         }
     }
@@ -46,6 +49,7 @@ public actor AnalysisWorker {
         public var analyzed = 0
         public var textFound = 0
         public var tagged = 0
+        public var facesFound = 0
         public var failed = 0
         public var parked = 0
         public var droppedBatches = 0
@@ -60,6 +64,7 @@ public actor AnalysisWorker {
     private let catalog: Catalog
     private let resolver: any MediaResolving
     private let analyzer: VisionAnalyzer
+    private let faceIndex: FaceIndex
     private let configuration: Configuration
 
     private var task: Task<Void, Never>?
@@ -73,6 +78,11 @@ public actor AnalysisWorker {
         self.catalog = catalog
         self.resolver = resolver
         self.analyzer = VisionAnalyzer(configuration: configuration.analyzer)
+        self.faceIndex = FaceIndex(
+            catalog: catalog,
+            revision: Int64(VNGenerateImageFeaturePrintRequest.currentRevision),
+            clusterer: FaceClusterer(configuration: configuration.faces)
+        )
         self.configuration = configuration
     }
 
@@ -88,7 +98,7 @@ public actor AnalysisWorker {
         task = Task(priority: .utility) {
             try? await catalog.beginAnalysisSession()
             let outcome = await self.drainGuarded()
-            Log.indexing.info("analysis: \(outcome.analyzed) analysed, \(outcome.tagged) tagged, \(outcome.textFound) with text, \(outcome.failed) failed, \(outcome.parked) parked")
+            Log.indexing.info("analysis: \(outcome.analyzed) analysed, \(outcome.tagged) tagged, \(outcome.textFound) with text, \(outcome.facesFound) faces, \(outcome.failed) failed, \(outcome.parked) parked")
             self.task = nil
         }
     }
@@ -154,6 +164,7 @@ public actor AnalysisWorker {
         let ids = jobs.map(\.mediaID)
         let targets = await resolver.targets(for: ids)
         let analyzer = self.analyzer
+        let faceIndex = self.faceIndex
         let lane = configuration.visionLane
         let maximumAttempts = configuration.maximumAttempts
 
@@ -173,8 +184,13 @@ public actor AnalysisWorker {
                     case .cancelled:
                         return .released(job)
                     case .completed(let still):
-                        guard let still else {
+                        guard var still else {
                             return .failed(job, "The file could not be decoded.")
+                        }
+                        // The person a face belongs to is not Vision's answer; the index assigns it, serially,
+                        // before the row is written so a face is never stored without its cluster.
+                        if !still.faces.isEmpty {
+                            still.faces = await faceIndex.assign(still.faces, mediaID: job.mediaID)
                         }
                         return .analyzed(job, still)
                     }
@@ -214,10 +230,12 @@ public actor AnalysisWorker {
                         modelSaidSo: still.isUtility
                     ),
                     tags: tags,
-                    dhash: still.dhash
+                    dhash: still.dhash,
+                    faces: still.faces
                 ))
                 if still.ocrText != nil { outcome.textFound += 1 }
                 if !tags.isEmpty { outcome.tagged += 1 }
+                outcome.facesFound += still.faces.count
             case .failed(let job, _):
                 if job.attempts >= maximumAttempts { parked.append(job.mediaID) } else { failed.append(job.mediaID) }
             case .released(let job):

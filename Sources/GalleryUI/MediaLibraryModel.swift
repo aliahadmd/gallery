@@ -70,6 +70,8 @@ public final class MediaLibraryModel {
     /// Tag albums from the analysis pass, and the pass's own numbers (kept apart from the drain's so a
     /// finished analysis cannot mask an active scan in the HUD).
     public private(set) var tags: [Album] = []
+    /// Face clusters with enough photos to be a person. Numbered until somebody names them.
+    public private(set) var people: [Album] = []
     public private(set) var analysisProgress: [SourceID: IndexProgress] = [:]
     private var analysisFeed: Task<Void, Never>?
     /// One level of folder albums per source, keyed by the source they belong to.
@@ -230,6 +232,30 @@ public final class MediaLibraryModel {
     /// The tag shelf, from the analysis pass. Cheap by construction: one grouped count over a small table.
     public func refreshTags() async {
         tags = (try? await reader.tagAlbums()) ?? []
+        people = (try? await reader.peopleAlbums()) ?? []
+    }
+
+    /// A person's name is the user's, and a re-analysis never overwrites it: renaming writes the row the
+    /// People shelf reads, and nothing else touches that column.
+    public func renamePerson(_ album: Album, to name: String) async {
+        guard case .person(let key) = album.kind else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try await catalog.renameFaceCluster(id: key.stableID, name: trimmed.isEmpty ? nil : trimmed)
+            await refreshTags()
+        } catch {
+            notices.append(Notice("That person could not be named.", detail: "\(error)"))
+        }
+    }
+
+    public func hidePerson(_ album: Album) async {
+        guard case .person(let key) = album.kind else { return }
+        do {
+            try await catalog.setFaceClusterHidden(id: key.stableID, hidden: true)
+            await refreshTags()
+        } catch {
+            notices.append(Notice("That person could not be hidden.", detail: "\(error)"))
+        }
     }
 
     /// Pause/resume the third pass. The worker publishes a snapshot when it changes, so the HUD follows
@@ -788,6 +814,8 @@ public final class MediaLibraryModel {
         case .month(let bucket): return months.first { $0.kind == .month(bucket) }?.title ?? "Month"
         case .location(let id): return places.first { $0.kind == .location(id) }?.title ?? "Place"
         case .tag(let key): return TagVocabulary.title(for: key.slug)
+        case .person(let key):
+            return people.first { $0.kind == .person(key) }?.title ?? "Person"
         case .subfolder(let sourceID, let path):
             if let match = subfolders[sourceID]?.first(where: {
                 $0.kind == .subfolder(sourceID, relativePath: path)
