@@ -64,6 +64,16 @@ public struct SidebarView: View {
                         .badge(model.days.count)
                 }
             }
+
+            // Places come from GPS, so a library without geotagged photos simply has no shelf — and one
+            // whose photos have never been geocoded still lists them, by coordinate.
+            if !model.places.isEmpty {
+                Section("Places") {
+                    ForEach(model.places) { album in
+                        dateRow(album, symbol: "mappin.and.ellipse")
+                    }
+                }
+            }
         }
         .listStyle(.sidebar)
     }
@@ -159,7 +169,8 @@ extension AlbumKind {
         case .recentlyDeleted: "Recently Deleted"
         case .uncategorized: "Uncategorized"
         case .problems: "Problems"
-        case .day, .month, .event, .location, .place, .smart: "Album"
+        case .location: "Place"
+        case .day, .month, .event, .place, .smart: "Album"
         }
     }
 }

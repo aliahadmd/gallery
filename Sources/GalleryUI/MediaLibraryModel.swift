@@ -53,6 +53,8 @@ public final class MediaLibraryModel {
     /// Date shelves, from the catalog: days keep only buckets with enough photos to be a real day.
     public private(set) var days: [Album] = []
     public private(set) var months: [Album] = []
+    /// Place albums. A cluster nobody has named yet still appears, titled by its coordinates.
+    public private(set) var places: [Album] = []
 
     /// What the search field shows, and what its last settled keystroke actually searched for. Two properties
     /// because typing must not wait for SQLite, and a half-typed word must not replace the grid.
@@ -75,6 +77,7 @@ public final class MediaLibraryModel {
     /// silently orphan a playing `AVPlayer`.
     private let players: PlayerPool
     private let trash: TrashService
+    private let locations: LocationDeriver
     private var cursor: SortCursor?
     private var generation = 0
     private var feed: Task<Void, Never>?
@@ -87,7 +90,7 @@ public final class MediaLibraryModel {
 
     public init(reader: CatalogReader, coordinator: IndexCoordinator, passB: MetadataWorker,
                 thumbnails: ThumbnailService, catalog: Catalog, resolver: any MediaResolving,
-                trashRoot: URL) {
+                trashRoot: URL, geocoder: any ReverseGeocoding = AppleGeocoder()) {
         self.reader = reader
         self.coordinator = coordinator
         self.passB = passB
@@ -95,6 +98,7 @@ public final class MediaLibraryModel {
         self.catalog = catalog
         self.players = PlayerPool(resolver: resolver)
         self.trash = TrashService(catalog: catalog, resolver: resolver, root: trashRoot)
+        self.locations = LocationDeriver(catalog: catalog, geocoder: geocoder)
     }
 
     // MARK: - Lifecycle
@@ -117,8 +121,9 @@ public final class MediaLibraryModel {
                 // repeated frame of the same numbers is not a new answer worth throwing away a cursor for.
                 if update.phase == .finished, update != was {
                     // Capture dates are what the day and month shelves are made of, and the drain is what
-                    // writes them.
+                    // writes them. GPS arrives the same way, and the places shelf is derived from it.
                     await self.refreshAlbums()
+                    await self.refreshPlaces()
                     await self.reload()
                 }
             }
@@ -163,6 +168,7 @@ public final class MediaLibraryModel {
         }
         await refreshSources()
         await refreshAlbums()
+        await refreshPlaces()
         await reload()
     }
 
@@ -176,6 +182,14 @@ public final class MediaLibraryModel {
         let freshMonths = (try? await reader.monthAlbums()) ?? []
         days = freshDays
         months = freshMonths
+    }
+
+    /// Places are derived, not queried: the deriver re-runs the clusterer over every geotagged row, carries
+    /// existing names forward, and names what it can reach. Offline this still produces albums — titled by
+    /// coordinate — which is the promise that makes geocoding a refinement rather than a dependency.
+    public func refreshPlaces() async {
+        _ = await locations.refresh()
+        places = (try? await reader.locationAlbums()) ?? []
     }
 
     public func stop() {
@@ -579,6 +593,7 @@ public final class MediaLibraryModel {
         switch selection {
         case .day(let bucket): return days.first { $0.kind == .day(bucket) }?.title ?? "Day"
         case .month(let bucket): return months.first { $0.kind == .month(bucket) }?.title ?? "Month"
+        case .location(let id): return places.first { $0.kind == .location(id) }?.title ?? "Place"
         default: return selection.uiTitle(sources: sources)
         }
     }

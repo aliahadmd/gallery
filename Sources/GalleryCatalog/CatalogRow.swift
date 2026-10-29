@@ -94,8 +94,29 @@ enum CatalogRow {
         return GPSPoint(latitude: latitude, longitude: longitude)
     }
 
-    static func trashEntry(_ row: Row) throws -> TrashLedgerEntry {
-        TrashLedgerEntry(
+    static func locationCluster(_ row: Row) throws -> LocationCluster {
+        let level = ClusterLevel(code: Int(try row.int64(named: "level")))
+        let name = try row.optionalString(named: "name")
+        let placemark = (name != nil || level.isNamed) ? PlaceSummary(
+            name: name,
+            locality: try row.optionalString(named: "locality"),
+            subLocality: try row.optionalString(named: "sublocality"),
+            adminArea: try row.optionalString(named: "admin_area"),
+            country: try row.optionalString(named: "country"),
+            isoCountryCode: try row.optionalString(named: "iso_country")
+        ) : nil
+        return LocationCluster(
+            id: ClusterID(rawValue: try row.int64(named: "id")),
+            center: GPSPoint(latitude: try row.double(named: "center_lat"),
+                             longitude: try row.double(named: "center_lon")),
+            radiusMeters: try row.double(named: "radius_m"),
+            count: Int(try row.int64(named: "item_count")),
+            placemark: placemark,
+            level: level
+        )
+    }
+
+    static func trashEntry(_ row: Row) throws -> TrashLedgerEntry {        TrashLedgerEntry(
             id: try row.int64(named: "id"),
             mediaID: MediaID(rawValue: try row.int64(named: "media_id")),
             sourceID: SourceID(rawValue: try row.int64(named: "src_id")),

@@ -10,6 +10,34 @@ public enum ClusterLevel: String, Sendable, Hashable, Codable, CaseIterable {
     case grid
 
     public var isNamed: Bool { self != .grid }
+
+    /// The schema's spelling. Ordered from most to least specific, so `grid` is the default a row gets
+    /// before anything has been geocoded — which is exactly what an offline library should show.
+    public var code: Int {
+        switch self {
+        case .precise: 0
+        case .street: 1
+        case .city: 2
+        case .country: 3
+        case .grid: 4
+        }
+    }
+
+    public init(code: Int) {
+        self = Self.allCases.first { $0.code == code } ?? .grid
+    }
+}
+
+/// One photo and where it was taken. Kept in the domain so the catalog and the clusterer agree on the shape
+/// without either importing the other.
+public struct GeotaggedPoint: Sendable, Hashable {
+    public var mediaID: MediaID
+    public var gps: GPSPoint
+
+    public init(mediaID: MediaID, gps: GPSPoint) {
+        self.mediaID = mediaID
+        self.gps = gps
+    }
 }
 
 public struct PlaceSummary: Sendable, Hashable, Codable {

@@ -190,25 +190,17 @@ public actor CatalogReader {
     }
 
     public func locationAlbums() throws -> [Album] {
-        try handle.query(
-            """
-            SELECT id, name, locality, admin_area, country, item_count
-            FROM location_cluster ORDER BY item_count DESC
-            """
-        ).map { row in
-            let clusterID = ClusterID(rawValue: try row.int64(named: "id"))
-            let place = PlaceSummary(
-                name: try row.optionalString(named: "name"),
-                locality: try row.optionalString(named: "locality"),
-                adminArea: try row.optionalString(named: "admin_area"),
-                country: try row.optionalString(named: "country")
-            )
+        try handle.query(LocationStatements.allClusters).map { row in
+            let cluster = try CatalogRow.locationCluster(row)
             return Album(
-                id: AlbumID(rawValue: Album.syntheticID(for: .location(clusterID))),
-                kind: .location(clusterID),
-                title: place.displayName ?? "Unnamed place",
-                itemCount: Int(try row.int64(named: "item_count")),
-                sortKey: -Int64(try row.int64(named: "item_count"))
+                id: AlbumID(rawValue: Album.syntheticID(for: .location(cluster.id))),
+                kind: .location(cluster.id),
+                // A cluster that has not been geocoded yet is still an album: `title` falls back to the
+                // coordinate label, which is what an offline library shows and the plan promises.
+                title: cluster.title,
+                subtitle: cluster.placemark?.country,
+                itemCount: cluster.count,
+                sortKey: -Int64(cluster.count)
             )
         }
     }

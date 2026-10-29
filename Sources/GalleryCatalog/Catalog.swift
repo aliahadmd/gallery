@@ -363,6 +363,109 @@ public actor Catalog {
         }
     }
 
+    // MARK: - Location clusters
+
+    /// Every live row that knows where it was taken — the clusterer's whole input.
+    public func geotaggedPoints() throws -> [GeotaggedPoint] {
+        try handle.query(LocationStatements.gpsPoints).compactMap { row in
+            guard let id = try? row.int64(named: "id"),
+                  let latitude = try? row.double(named: "lat"),
+                  let longitude = try? row.double(named: "lon") else { return nil }
+            return GeotaggedPoint(mediaID: MediaID(rawValue: id),
+                                  gps: GPSPoint(latitude: latitude, longitude: longitude))
+        }
+    }
+
+    public func locationClusters() throws -> [LocationCluster] {
+        try handle.query(LocationStatements.allClusters).map(CatalogRow.locationCluster)
+    }
+
+    /// Replaces the derived cluster tables in one transaction. Names on `clusters` are kept — the deriver
+    /// carries them over from the previous run or from the cache, so a rescan never un-names a place.
+    public func replaceClusters(_ clusters: [LocationCluster],
+                                membership: [ClusterID: [MediaID]]) throws {
+        try handle.write {
+            // Cascades to cluster_member; media keeps its own copy of the id, so it is cleared explicitly.
+            try handle.exec(LocationStatements.deleteClusters)
+            try handle.exec(LocationStatements.clearMembership)
+            for cluster in clusters {
+                let placemark = cluster.placemark
+                try handle.exec(LocationStatements.insertCluster, [
+                    .integer(cluster.id.rawValue),
+                    .real(cluster.center.latitude),
+                    .real(cluster.center.longitude),
+                    .real(cluster.radiusMeters),
+                    .integer(Int64(cluster.count)),
+                    .integer(Int64(cluster.level.code)),
+                    placemark?.name.map(Value.text) ?? .null,
+                    placemark?.locality.map(Value.text) ?? .null,
+                    placemark?.subLocality.map(Value.text) ?? .null,
+                    placemark?.adminArea.map(Value.text) ?? .null,
+                    placemark?.country.map(Value.text) ?? .null,
+                    placemark?.isoCountryCode.map(Value.text) ?? .null,
+                    placemark?.placeKey.map(Value.text) ?? .null,
+                    cluster.level.isNamed ? .integer(Date().nanoseconds) : .null,
+                ])
+                for mediaID in membership[cluster.id] ?? [] {
+                    try handle.exec(LocationStatements.insertMember,
+                                    [.integer(cluster.id.rawValue), .integer(mediaID.rawValue)])
+                    try handle.exec(LocationStatements.assignMember, [
+                        .integer(cluster.id.rawValue),
+                        placemark?.placeKey.map(Value.text) ?? .null,
+                        .integer(mediaID.rawValue),
+                    ])
+                }
+            }
+        }
+    }
+
+    /// What the cache says about a coordinate, including "we tried and there is nothing here" — which is a
+    /// different answer from "we have never tried", and the only one that stops a dead network being retried
+    /// on every scan.
+    public func cachedGeocode(key: String) throws -> GeocodeCacheEntry? {
+        guard let row = try handle.firstRow(LocationStatements.cachedGeocode, [.text(key)]) else {
+            return nil
+        }
+        let didFail = (try? row.int64(named: "did_fail")) == 1
+        let payload = (try? row.string(named: "payload")) ?? ""
+        let placemark = didFail ? nil : try? JSONDecoder().decode(PlaceSummary.self,
+                                                                  from: Data(payload.utf8))
+        let fetched = (try? row.int64(named: "fetched_ns")).map(Date.init(nanoseconds:)) ?? .distantPast
+        return GeocodeCacheEntry(placemark: placemark, didFail: didFail, fetchedAt: fetched)
+    }
+
+    public func storeGeocode(key: String, placemark: PlaceSummary?, didFail: Bool) throws {
+        let payload = placemark.flatMap { try? JSONEncoder().encode($0) }
+            .map { String(decoding: $0, as: UTF8.self) } ?? ""
+        try handle.write {
+            try handle.exec(LocationStatements.storeGeocode, [
+                .text(key), .text(payload), .integer(Date().nanoseconds), .integer(didFail ? 1 : 0),
+            ])
+        }
+    }
+
+    public func recordClusterGeocode(id: ClusterID, placemark: PlaceSummary?,
+                                     level: ClusterLevel, didFail: Bool) throws {
+        try handle.write {
+            try handle.exec(LocationStatements.updateClusterName, [
+                placemark?.name.map(Value.text) ?? .null,
+                placemark?.locality.map(Value.text) ?? .null,
+                placemark?.subLocality.map(Value.text) ?? .null,
+                placemark?.adminArea.map(Value.text) ?? .null,
+                placemark?.country.map(Value.text) ?? .null,
+                placemark?.isoCountryCode.map(Value.text) ?? .null,
+                placemark?.placeKey.map(Value.text) ?? .null,
+                .integer(Int64(level.code)),
+                .integer(Date().nanoseconds),
+                .integer(id.rawValue),
+            ])
+            try handle.exec(LocationStatements.assignPlaceKey, [
+                placemark?.placeKey.map(Value.text) ?? .null,
+                .integer(id.rawValue),
+            ])
+        }
+    }
+
     // MARK: - Scan queue
 
     /// One statement, two entry points: which media rows to pick is the only difference between "everything
@@ -551,6 +654,20 @@ public struct WorkItem: Sendable, Hashable {
 public enum TrashMode: Int16, Sendable, Hashable, Codable {
     case systemTrash = 0
     case appTrash = 1
+}
+
+/// One answer from the geocode cache. `didFail` is a real answer: a machine that was offline when a place
+/// was first seen must not re-ask Apple on every scan — but it is a *dated* one, because Wi-Fi comes back.
+public struct GeocodeCacheEntry: Sendable, Hashable {
+    public var placemark: PlaceSummary?
+    public var didFail: Bool
+    public var fetchedAt: Date
+
+    public init(placemark: PlaceSummary?, didFail: Bool, fetchedAt: Date) {
+        self.placemark = placemark
+        self.didFail = didFail
+        self.fetchedAt = fetchedAt
+    }
 }
 
 /// The undo record for one trashed item. `toRelativePath` is only meaningful for `.appTrash`; the system
