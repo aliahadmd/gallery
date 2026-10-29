@@ -61,7 +61,8 @@ final class Fixture {
         let pipeline = Self.pipeline(under: home, catalog: catalog, reader: reader, resolver: resolver)
         coordinator = walk
         model = MediaLibraryModel(reader: reader, coordinator: walk, passB: pipeline.worker,
-                                  thumbnails: pipeline.thumbnails, catalog: catalog, resolver: resolver)
+                                  thumbnails: pipeline.thumbnails, catalog: catalog, resolver: resolver,
+                                  trashRoot: home.appendingPathComponent("trash", isDirectory: true))
         drains.append(pipeline.worker)
     }
 
@@ -90,7 +91,9 @@ final class Fixture {
         drains.append(pipeline.worker)
         return Relaunch(model: MediaLibraryModel(reader: secondReader, coordinator: second,
                                                  passB: pipeline.worker, thumbnails: pipeline.thumbnails,
-                                                 catalog: secondCatalog, resolver: secondResolver),
+                                                 catalog: secondCatalog, resolver: secondResolver,
+                                                 trashRoot: directory.appendingPathComponent("trash",
+                                                                                             isDirectory: true)),
                         coordinator: second)
     }
 
@@ -624,5 +627,65 @@ final class Fixture {
                 && fixture.model.items.allSatisfy { $0.kind == .image }
         }
         #expect(fixture.model.items.first?.kind == .image)
+    }
+
+    @Test("Trashing moves the file into the ledger's trash and hides the row")
+    func trashMovesFileAndHidesRow() async throws {
+        let fixture = try await Fixture(files: 3)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+        let item = try #require(fixture.model.items.first)
+        let path = fixture.media.appendingPathComponent(item.relativePath)
+
+        await fixture.model.moveToTrash([item.id])
+
+        #expect(!FileManager.default.fileExists(atPath: path.path), "the file really left the folder")
+        let trashed = fixture.directory.appendingPathComponent("trash")
+            .appendingPathComponent("\(item.sourceID.rawValue)/\(item.relativePath)")
+        #expect(FileManager.default.fileExists(atPath: trashed.path), "and it is where the ledger says it is")
+        #expect(fixture.model.rowCount == 2)
+        #expect(try await fixture.reader.count(album: .recentlyDeleted) == 1)
+        #expect(fixture.model.notices.isEmpty)
+    }
+
+    @Test("Restoring puts the file back and returns the row to its albums")
+    func restoreReturnsFileAndRow() async throws {
+        let fixture = try await Fixture(files: 3)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+        let item = try #require(fixture.model.items.first)
+        let path = fixture.media.appendingPathComponent(item.relativePath)
+        await fixture.model.moveToTrash([item.id])
+
+        await fixture.model.select(.recentlyDeleted)
+        #expect(fixture.model.items.map(\.id) == [item.id])
+
+        await fixture.model.restore([item.id])
+
+        #expect(FileManager.default.fileExists(atPath: path.path), "the file is back at its old path")
+        #expect(try await fixture.reader.count(album: .recentlyDeleted) == 0)
+        await fixture.model.select(.all)
+        #expect(fixture.model.rowCount == 3)
+    }
+
+    @Test("Deleting forever removes the file and the undo record stops offering it")
+    func deleteForeverRemovesTheFile() async throws {
+        let fixture = try await Fixture(files: 2)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+        let item = try #require(fixture.model.items.first)
+        let trashed = fixture.directory.appendingPathComponent("trash")
+            .appendingPathComponent("\(item.sourceID.rawValue)/\(item.relativePath)")
+        await fixture.model.moveToTrash([item.id])
+        #expect(FileManager.default.fileExists(atPath: trashed.path))
+
+        await fixture.model.select(.recentlyDeleted)
+        await fixture.model.deleteForever([item.id])
+
+        #expect(!FileManager.default.fileExists(atPath: trashed.path))
+        #expect(try await fixture.reader.count(album: .recentlyDeleted) == 0)
     }
 }

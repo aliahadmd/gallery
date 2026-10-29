@@ -26,6 +26,7 @@ public struct ViewerView: View {
     @State private var duration: Double = 0
     @State private var isPlaying = false
     @State private var isScrubbing = false
+    @State private var isSlideshow = false
 
     @FocusState private var isFocused: Bool
 
@@ -46,10 +47,12 @@ public struct ViewerView: View {
             .onAppear { isFocused = true }
             .onChange(of: model.viewerID) { _, _ in resetMedia() }
             .onKeyPress(.leftArrow) {
+                isSlideshow = false
                 Task { await model.stepViewer(by: -1) }
                 return .handled
             }
             .onKeyPress(.rightArrow) {
+                isSlideshow = false
                 Task { await model.stepViewer(by: 1) }
                 return .handled
             }
@@ -57,14 +60,21 @@ public struct ViewerView: View {
                 togglePlayback()
                 return .handled
             }
+            .onKeyPress(KeyEquivalent("s")) {
+                guard model.viewerItem?.kind == .image else { return .ignored }
+                isSlideshow.toggle()
+                return .handled
+            }
             .onKeyPress(.upArrow) { setZoom(zoom * 1.25); return .handled }
             .onKeyPress(.downArrow) { setZoom(zoom / 1.25); return .handled }
             .onKeyPress(.escape) {
+                isSlideshow = false
                 model.closeViewer()
                 return .handled
             }
             .task(id: LoadKey(item)) { await load(item) }
             .task(id: model.viewerID) { await trackPlayback() }
+            .task(id: isSlideshow) { await runSlideshow() }
             .transition(.opacity)
         }
     }
@@ -129,6 +139,15 @@ public struct ViewerView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Favorite (⌘⇧F)")
+
+                if item.kind == .image {
+                    Button { isSlideshow.toggle() } label: {
+                        Image(systemName: isSlideshow ? "pause.rectangle" : "play.rectangle")
+                            .foregroundStyle(isSlideshow ? .yellow : .white)
+                    }
+                    .buttonStyle(.plain)
+                    .help(isSlideshow ? "Stop the slideshow (S)" : "Start a slideshow (S)")
+                }
 
                 if let index = model.items.firstIndex(where: { $0.id == item.id }) {
                     Text("\(index + 1) of \(model.items.count)")
@@ -274,6 +293,27 @@ public struct ViewerView: View {
                 }
             }
             try? await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
+    /// A photo every four seconds, until the album ends or a clip arrives. A clip is not advanced past: it
+    /// plays, and the slideshow stops on it, because cutting a video short to show the next picture is not
+    /// what "slideshow" means to anyone.
+    private func runSlideshow() async {
+        guard isSlideshow else { return }
+        while !Task.isCancelled, isSlideshow {
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, isSlideshow else { return }
+            guard let item = model.viewerItem, item.kind == .image else {
+                isSlideshow = false
+                return
+            }
+            let before = model.viewerID
+            await model.stepViewer(by: 1)
+            if model.viewerID == before {
+                isSlideshow = false
+                return
+            }
         }
     }
 

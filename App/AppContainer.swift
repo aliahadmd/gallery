@@ -34,7 +34,9 @@ final class AppContainer {
                                         resolver: resolver, thumbnails: thumbnails)
 
             model = MediaLibraryModel(reader: reader, coordinator: coordinator, passB: worker,
-                                      thumbnails: thumbnails, catalog: catalog, resolver: resolver)
+                                      thumbnails: thumbnails, catalog: catalog, resolver: resolver,
+                                      trashRoot: url.deletingLastPathComponent()
+                                          .appendingPathComponent("GalleryTrash", isDirectory: true))
             startupFailure = nil
         } catch {
             model = nil

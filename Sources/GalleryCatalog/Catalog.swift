@@ -330,8 +330,25 @@ public actor Catalog {
         }
     }
 
-    public func purgeOlderThan(_ date: Date) throws -> [TrashLedgerEntry] {
-        try handle.query(
+    /// The undo record behind one trashed row: the newest ledger entry, because a file trashed, restored and
+    /// trashed again has three and only the last one describes where it is now.
+    public func trashEntry(for mediaID: MediaID) throws -> TrashLedgerEntry? {
+        try handle.firstRow(
+            "SELECT * FROM trash_ledger WHERE media_id = ? ORDER BY trashed_ns DESC, id DESC LIMIT 1",
+            [.integer(mediaID.rawValue)]
+        ).map(CatalogRow.trashEntry)
+    }
+
+    /// Where the file actually went. Written after the move because neither the system Trash nor a name
+    /// collision can be predicted before it.
+    public func recordTrashDestination(ledgerID: Int64, path: String) throws {
+        try handle.write {
+            try handle.exec("UPDATE trash_ledger SET to_rel = ? WHERE id = ?",
+                            [.text(path), .integer(ledgerID)])
+        }
+    }
+
+    public func purgeOlderThan(_ date: Date) throws -> [TrashLedgerEntry] {        try handle.query(
             "SELECT * FROM trash_ledger WHERE state = ? AND trashed_ns < ?",
             [.integer(Int64(TrashState.trashed.rawValue)), .integer(date.nanoseconds)]
         ).map { try CatalogRow.trashEntry($0) }

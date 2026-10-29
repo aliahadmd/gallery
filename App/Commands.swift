@@ -36,6 +36,22 @@ struct GalleryCommands: Commands {
             .keyboardShortcut("f", modifiers: [.command, .shift])
             .disabled(model.selectedID == nil)
 
+            // ⌘⌫, not ⌘⇧⌫: the shifted form is macOS's own "empty trash" gesture on other apps and is
+            // reserved. In Recently Deleted the same key is the undo, because that is where the user is.
+            Button(model.isRecentlyDeleted ? "Restore" : "Move to Trash") {
+                if let id = model.selectedID {
+                    Task {
+                        if model.isRecentlyDeleted {
+                            await model.restore([id])
+                        } else {
+                            await model.moveToTrash([id])
+                        }
+                    }
+                }
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(model.selectedID == nil)
+
             Divider()
 
             Button("Show Info") {

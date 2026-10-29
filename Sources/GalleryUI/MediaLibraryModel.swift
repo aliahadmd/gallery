@@ -74,6 +74,7 @@ public final class MediaLibraryModel {
     /// The clips the viewer has open. Owned by the model rather than the view so a SwiftUI rebuild cannot
     /// silently orphan a playing `AVPlayer`.
     private let players: PlayerPool
+    private let trash: TrashService
     private var cursor: SortCursor?
     private var generation = 0
     private var feed: Task<Void, Never>?
@@ -85,13 +86,15 @@ public final class MediaLibraryModel {
     private var windowFlush: Task<Void, Never>?
 
     public init(reader: CatalogReader, coordinator: IndexCoordinator, passB: MetadataWorker,
-                thumbnails: ThumbnailService, catalog: Catalog, resolver: any MediaResolving) {
+                thumbnails: ThumbnailService, catalog: Catalog, resolver: any MediaResolving,
+                trashRoot: URL) {
         self.reader = reader
         self.coordinator = coordinator
         self.passB = passB
         self.thumbnails = thumbnails
         self.catalog = catalog
         self.players = PlayerPool(resolver: resolver)
+        self.trash = TrashService(catalog: catalog, resolver: resolver, root: trashRoot)
     }
 
     // MARK: - Lifecycle
@@ -503,6 +506,53 @@ public final class MediaLibraryModel {
         } catch {
             notices.append(Notice("Could not change the favorite.", detail: "\(error)"))
         }
+    }
+
+    // MARK: - Trash
+
+    public var isRecentlyDeleted: Bool { selection == .recentlyDeleted }
+
+    /// ⌘⌫. The file leaves the folder and the row leaves every album; both come back together if the move
+    /// fails, because a row flagged deleted over a file that never moved is the one lie this can't tell.
+    public func moveToTrash(_ ids: [MediaID]) async {
+        let selected = items.filter { ids.contains($0.id) }
+        guard !selected.isEmpty else { return }
+        let outcome = await trash.trash(selected)
+        report(outcome.failed, what: "delete")
+        if let viewerID, ids.contains(viewerID) { closeViewer() }
+        await reload()
+        await refreshAlbums()
+    }
+
+    public func restore(_ ids: [MediaID]) async {
+        let selected = items.filter { ids.contains($0.id) }
+        guard !selected.isEmpty else { return }
+        let outcome = await trash.restore(selected)
+        report(outcome.failed, what: "restore")
+        if let viewerID, ids.contains(viewerID) { closeViewer() }
+        await reload()
+        await refreshAlbums()
+    }
+
+    /// Empty out of the trash for good. The row stays in the catalog as `purged`, so the ledger still knows
+    /// where the file went after it stopped existing.
+    public func deleteForever(_ ids: [MediaID]) async {
+        let selected = items.filter { ids.contains($0.id) }
+        guard !selected.isEmpty else { return }
+        let outcome = await trash.purge(selected)
+        report(outcome.failed, what: "delete forever")
+        if let viewerID, ids.contains(viewerID) { closeViewer() }
+        await reload()
+        await refreshAlbums()
+    }
+
+    private func report(_ failures: [MediaID: String], what: String) {
+        guard !failures.isEmpty else { return }
+        let detail = failures.values.sorted().first
+        let count = failures.count
+        notices.append(Notice(count == 1 ? "One item could not \(what)."
+                                         : "\(count) items could not \(what).",
+                              detail: detail))
     }
 
     // MARK: - Notices

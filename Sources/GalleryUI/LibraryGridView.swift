@@ -41,20 +41,43 @@ public struct LibraryGridView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if let selected = model.selectedItem {
-                    Button {
-                        Task { await model.toggleFavorite(selected.id) }
-                    } label: {
-                        Label(selected.isFavorite ? "Unfavorite" : "Favorite",
-                              systemImage: selected.isFavorite ? "star.fill" : "star")
-                    }
-                    .help("Favorite (⌘⇧F)")
+                    if model.isRecentlyDeleted {
+                        Button {
+                            Task { await model.restore([selected.id]) }
+                        } label: {
+                            Label("Restore", systemImage: "arrow.uturn.backward")
+                        }
+                        .help("Put the photo back where it was (⌘⌫)")
 
-                    Button {
-                        model.openViewer(selected.id)
-                    } label: {
-                        Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
+                        Button {
+                            Task { await model.deleteForever([selected.id]) }
+                        } label: {
+                            Label("Delete Forever", systemImage: "trash.slash")
+                        }
+                        .help("Remove the file for good")
+                    } else {
+                        Button {
+                            Task { await model.moveToTrash([selected.id]) }
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .help("Move to Gallery's trash (⌘⌫)")
+
+                        Button {
+                            Task { await model.toggleFavorite(selected.id) }
+                        } label: {
+                            Label(selected.isFavorite ? "Unfavorite" : "Favorite",
+                                  systemImage: selected.isFavorite ? "star.fill" : "star")
+                        }
+                        .help("Favorite (⌘⇧F)")
+
+                        Button {
+                            model.openViewer(selected.id)
+                        } label: {
+                            Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
+                        }
+                        .help("Open the selected photo (Return)")
                     }
-                    .help("Open the selected photo (Return)")
                 }
 
                 Button {

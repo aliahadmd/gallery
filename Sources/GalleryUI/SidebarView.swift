@@ -22,6 +22,7 @@ public struct SidebarView: View {
         (.animated, "Animated", "film"),
         (.offline, "Not Downloaded", "icloud.slash"),
         (.problems, "Problems", "exclamationmark.triangle"),
+        (.recentlyDeleted, "Recently Deleted", "trash"),
     ]
 
     public var body: some View {

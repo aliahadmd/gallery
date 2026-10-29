@@ -6,7 +6,10 @@ struct GalleryApp: App {
     @State private var container = AppContainer()
 
     var body: some Scene {
-        WindowGroup {
+        // One window, not a `WindowGroup`: a second scene would run a second `model.start()` over the same
+        // coordinator and catalog — two progress feeds, two scans per folder — and opening a folder from
+        // Finder is an everyday event, not a request for a second library.
+        Window("Gallery", id: "library") {
             content
                 .frame(minWidth: 860, minHeight: 520)
         }

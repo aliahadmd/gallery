@@ -63,6 +63,17 @@ public struct MediaCellView: View {
                 model.select(item.id)
                 model.isInspectorPresented = true
             }
+            Divider()
+            if model.isRecentlyDeleted {
+                Button("Restore") { Task { await model.restore([item.id]) } }
+                Button("Delete Forever", role: .destructive) {
+                    Task { await model.deleteForever([item.id]) }
+                }
+            } else {
+                Button("Move to Trash", role: .destructive) {
+                    Task { await model.moveToTrash([item.id]) }
+                }
+            }
         }
         .help(item.relativePath)
         .onAppear { model.cellAppeared(item) }
