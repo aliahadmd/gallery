@@ -22,6 +22,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Gallery" "$APP/Contents/MacOS/Gallery"
 chmod +x "$APP/Contents/MacOS/Gallery"
 cp "$ROOT/App/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/App/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Sign the binary first, then the bundle, both with the same entitlements.

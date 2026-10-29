@@ -1,0 +1,19 @@
+Gallery — install
+
+1. Double-click the zip to unpack it.
+2. Drag "Gallery.app" into /Applications (or any folder where you keep apps).
+3. First launch: right-click Gallery.app and choose Open, then Open again.
+   Gallery is signed with a free local development certificate, not notarized by
+   Apple, so macOS asks for confirmation once. That is expected and is the only
+   extra step.
+4. If macOS instead says the app is "damaged" (rare; some unzip tools re-pack the
+   bundle), open Terminal and run:
+       xattr -dr com.apple.quarantine /Applications/Gallery.app
+   Then open it normally.
+5. Gallery reads your folders in place and uploads nothing. Add a folder with ⌘O.
+
+Updating
+--------
+Quit Gallery, replace the app with the new version, then re-add your folders
+once. macOS ties the folder permission to the app's signature, so every new
+build asks for it again.
