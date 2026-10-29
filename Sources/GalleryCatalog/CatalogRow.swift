@@ -71,7 +71,10 @@ enum CatalogRow {
             addedAt: Date(nanoseconds: try row.int64(named: "added_ns")),
             indexedAt: nil,
             aesthetic: try row.double(named: "aesthetic"),
-            isUtility: try row.bool(named: "is_utility")
+            isUtility: try row.bool(named: "is_utility"),
+            category: MediaCategory(rawValue: Int16(truncatingIfNeeded:
+                try row.int64(named: "category_value"))) ?? .none,
+            categoryConfidence: try row.double(named: "category_confidence")
         )
     }
 
@@ -218,8 +221,14 @@ enum CatalogRow {
     media.cap_utc, media.cap_wall, media.cap_tz, media.cap_src,
     media.lat, media.lon, media.has_gps, media.place_key, media.cluster_id, media.device, media.lens,
     media.search_text, media.title, media.is_offline, media.trash, media.aesthetic, media.is_utility,
+    -- The user's feedback is folded into the projection here, so a cell badge and the category album
+    -- cannot disagree about what a photo is.
+    CASE WHEN cf.verdict < 0 THEN 0
+         WHEN cf.verdict > 0 THEN cf.category
+         ELSE media.category END AS category_value,
+    CASE WHEN cf.verdict > 0 THEN 1.0 ELSE media.category_confidence END AS category_confidence,
     CASE WHEN favorite.media_id IS NULL THEN 0 ELSE 1 END AS is_favorite
     """
 
-    static let itemFrom = "FROM media LEFT JOIN favorite ON favorite.media_id = media.id"
+    static let itemFrom = "FROM media LEFT JOIN favorite ON favorite.media_id = media.id LEFT JOIN category_feedback AS cf ON cf.media_id = media.id"
 }

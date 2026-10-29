@@ -19,7 +19,6 @@ public struct SidebarView: View {
         (.allVideos, "Videos", "video"),
         (.favorites, "Favorites", "star"),
         (.duplicates, "Duplicates", "rectangle.on.rectangle"),
-        (.screenshots, "Screenshots", "camera.viewfinder"),
         (.raw, "RAW", "doc"),
         (.livePhotos, "Live Photos", "livephoto"),
         (.animated, "Animated", "film"),
@@ -30,6 +29,24 @@ public struct SidebarView: View {
 
     public var body: some View {
         List(selection: albumSelection) {
+            // The cleanup shelf sits at the top: it is the reason most people open this sidebar, and a
+            // library with fifty subfolders would otherwise bury it below the fold.
+            if !model.categoryCounts.isEmpty {
+                Section("Cleanup") {
+                    ForEach(model.categoryCounts) { row in
+                        HStack(spacing: 6) {
+                            Label(row.category.title, systemImage: row.category.symbol)
+                            Spacer()
+                            Text(row.count.formatted())
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        .tag(AlbumKind.category(row.category))
+                    }
+                }
+            }
+
             Section("Folders") {
                 if model.sources.isEmpty {
                     Text("No folders yet.")
@@ -257,6 +274,7 @@ extension AlbumKind {
         case .problems: "Problems"
         case .location: "Place"
         case .tag(let key): TagVocabulary.title(for: key.slug)
+        case .category(let category): category.title
         case .person: "Person"
         case .duplicates: "Duplicates"
         case .duplicateGroup: "Duplicate Set"

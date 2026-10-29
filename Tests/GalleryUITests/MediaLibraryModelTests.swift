@@ -27,6 +27,7 @@ final class Fixture {
     let reader: CatalogReader
     let coordinator: IndexCoordinator
     let editor: EditService
+    let rename: RenameService
     let model: MediaLibraryModel
     let suiteName: String
     let defaults: UserDefaults
@@ -63,10 +64,11 @@ final class Fixture {
         coordinator = walk
         editor = EditService(resolver: resolver, catalog: catalog,
                              trashRoot: home.appendingPathComponent("trash", isDirectory: true))
+        rename = RenameService(catalog: catalog, reader: reader, resolver: resolver)
         model = MediaLibraryModel(reader: reader, coordinator: walk, passB: pipeline.worker,
                                   thumbnails: pipeline.thumbnails, catalog: catalog, resolver: resolver,
                                   trashRoot: home.appendingPathComponent("trash", isDirectory: true),
-                                  editor: editor)
+                                  editor: editor, rename: rename)
         drains.append(pipeline.worker)
     }
 
@@ -101,7 +103,9 @@ final class Fixture {
                                                  catalog: secondCatalog, resolver: secondResolver,
                                                  trashRoot: directory.appendingPathComponent("trash",
                                                                                              isDirectory: true),
-                                                 editor: secondEditor),
+                                                 editor: secondEditor,
+                                                 rename: RenameService(catalog: secondCatalog, reader: secondReader,
+                                                                       resolver: secondResolver)),
                         coordinator: second)
     }
 

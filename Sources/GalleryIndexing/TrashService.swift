@@ -23,13 +23,19 @@ public actor TrashService {
     private let catalog: Catalog
     private let resolver: any MediaResolving
     private let root: URL
+    /// Trashing moves a file too; the watcher must not treat that as a user edit and rescan the folder.
+    private let selfWrites: SelfWriteGuard?
 
     /// `root` is the ledger's own directory (`Application Support/GalleryTrash`), never a user folder: a
     /// dot-folder inside the pictures would show up in the user's own file operations.
-    public init(catalog: Catalog, resolver: any MediaResolving, root: URL) {
+    public init(
+        catalog: Catalog, resolver: any MediaResolving, root: URL,
+        selfWrites: SelfWriteGuard? = nil
+    ) {
         self.catalog = catalog
         self.resolver = resolver
         self.root = root
+        self.selfWrites = selfWrites
     }
 
     /// Where a trashed file lives once it is out of the library.
@@ -68,6 +74,7 @@ public actor TrashService {
             do {
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
                                                         withIntermediateDirectories: true)
+                selfWrites?.note()
                 try FileManager.default.moveItem(at: target.url, to: destination)
                 try? await catalog.recordTrashDestination(
                     ledgerID: ledgerID,
@@ -115,6 +122,7 @@ public actor TrashService {
             do {
                 try FileManager.default.createDirectory(at: target.url.deletingLastPathComponent(),
                                                         withIntermediateDirectories: true)
+                selfWrites?.note()
                 try FileManager.default.moveItem(at: source, to: target.url)
                 try await catalog.restoreFromLedger(ledgerID: entry.id, mediaID: item.id,
                                                     succeeded: true, error: nil)

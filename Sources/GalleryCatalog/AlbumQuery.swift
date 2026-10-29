@@ -53,6 +53,20 @@ public enum AlbumQuery {
             core = .init(whereSQL: "media.place_key = ?", arguments: [.text(placeKey.canonical)])
         case .smart(let rule):
             core = compile(rule: rule)
+        case .category(let category):
+            // A confirmed verdict includes the row in that category; an exclusion removes it from every
+            // category, because feedback is one verdict per photo.
+            core = CompiledQuery(
+                whereSQL: """
+                ((media.category = ? AND NOT EXISTS (
+                    SELECT 1 FROM category_feedback f
+                    WHERE f.media_id = media.id AND f.verdict < 0))
+                 OR media.id IN (
+                    SELECT media_id FROM category_feedback WHERE category = ? AND verdict > 0))
+                """,
+                arguments: [.integer(Int64(category.rawValue)), .integer(Int64(category.rawValue))]
+            )
+
         case .tag(let key):
             core = .init(whereSQL: "media.id IN (SELECT media_id FROM media_tag WHERE slug = ?)",
                          arguments: [.text(key.slug)])

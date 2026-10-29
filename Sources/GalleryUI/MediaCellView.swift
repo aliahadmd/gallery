@@ -53,6 +53,14 @@ public struct MediaCellView: View {
             }
         }
         .contentShape(RoundedRectangle(cornerRadius: 4))
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: CellFramePreferenceKey.self,
+                    value: [item.id: proxy.frame(in: .named("libraryGrid"))]
+                )
+            }
+        }
         .onTapGesture(count: 2) { model.openViewer(item.id) }
         .onTapGesture {
             // SwiftUI's tap gesture does not carry the modifiers, and the click that extends a selection is
@@ -70,45 +78,93 @@ public struct MediaCellView: View {
             return NSItemProvider()
         }
         .contextMenu {
-            Button("Open") { model.openViewer(item.id) }
-            if model.canEdit(item) {
-                Button("Edit…") { Task { await model.openEditor(item.id) } }
-            }
-            if let actions = model.actions {
-                Button("Export a Copy…") { Task { await actions.exportCopies([item.id]) } }
-            }
-            if model.selectedMediaIDs.count >= 2 {
-                Button("Create Collage…") {
-                    Task { await model.createCollage(model.selectedMediaIDs) }
-                }
-            }
-            if item.kind == .image {
-                Button("Revert to Previous Version") {
-                    Task { await model.revertToPreviousVersion(item) }
-                }
-            }
-            Button(item.isFavorite ? "Remove from Favorites" : "Add to Favorites") {
-                Task { await model.toggleFavorite(item.id) }
-            }
-            Button("Show Info") {
-                model.select(item.id)
-                model.isInspectorPresented = true
-            }
-            Divider()
-            if model.isRecentlyDeleted {
-                Button("Restore") { Task { await model.restore([item.id]) } }
-                Button("Delete Forever", role: .destructive) {
-                    Task { await model.deleteForever([item.id]) }
-                }
-            } else {
-                Button("Move to Trash", role: .destructive) {
-                    Task { await model.moveToTrash([item.id]) }
-                }
-            }
+            contextMenu
         }
         .help(item.relativePath)
         .onAppear { model.cellAppeared(item) }
         .onDisappear { model.cellDisappeared(item) }
+    }
+
+    /// A right-click on a row that is part of the selection acts on the whole selection; on any other row
+    /// it acts on that row and selects it first. The menu titles say which one it is.
+    @ViewBuilder private var contextMenu: some View {
+        let multi = model.isInSelection(item)
+        Button("Open") { model.openViewer(item.id) }
+        if model.canEdit(item) {
+            Button("Edit…") { Task { await model.openEditor(item.id) } }
+        }
+        if let actions = model.actions {
+            Button(multi ? "Export \(model.selectedCount) Copies…" : "Export a Copy…") {
+                Task {
+                    if multi { await actions.exportSelection() } else { await actions.exportCopies([item.id]) }
+                }
+            }
+        }
+        if model.selectedMediaIDs.count >= 2 {
+            Button("Create Collage…") {
+                Task { await model.createCollage(model.selectedMediaIDs) }
+            }
+        }
+        if item.kind == .image {
+            Button("Revert to Previous Version") {
+                Task { await model.revertToPreviousVersion(item) }
+            }
+        }
+        Button(item.isFavorite ? "Remove from Favorites" : "Add to Favorites") {
+            Task {
+                if multi { await model.toggleFavoriteSelection() } else { await model.toggleFavorite(item.id) }
+            }
+        }
+        Button("Show Info") {
+            model.select(item.id)
+            model.isInspectorPresented = true
+        }
+        Divider()
+        Button("Edit Metadata…") {
+            if !multi { model.select(item.id) }
+            Task { await model.beginBatchMetadata() }
+        }
+        if item.kind == .image {
+            Button("Select Similar") { Task { await model.selectSimilar(to: item) } }
+        }
+        Button(multi ? "Rename \(model.selectedCount) Items…" : "Rename…") {
+            if !multi { model.select(item.id) }
+            Task { await model.beginRename() }
+        }
+        .disabled(!model.canRename)
+        Button("Move to Folder…") {
+            if !multi { model.select(item.id) }
+            Task { await model.actions?.moveSelection() }
+        }
+        .disabled(model.actions == nil)
+        Divider()
+        Button("Copy Name") {
+            if !multi { model.select(item.id) }
+            Task { await model.copySelectedNames() }
+        }
+        Button("Copy Path") {
+            if !multi { model.select(item.id) }
+            Task { await model.copySelectedPaths() }
+        }
+        Button("Reveal in Finder") {
+            if !multi { model.select(item.id) }
+            Task { await model.revealSelection() }
+        }
+        Divider()
+        if model.isRecentlyDeleted {
+            Button("Restore") {
+                Task {
+                    if multi { await model.restoreSelection() } else { await model.restore([item.id]) }
+                }
+            }
+            Button("Delete Forever", role: .destructive) {
+                if multi { model.requestDeleteForever() } else { Task { await model.deleteForever([item.id]) } }
+            }
+        } else {
+            Button(multi ? "Move \(model.selectedCount) Items to Trash" : "Move to Trash", role: .destructive) {
+                if multi { model.requestTrash() } else { Task { await model.moveToTrash([item.id]) } }
+            }
+        }
     }
 
     /// Tiles stay inside a 6:1 band in both directions: an ultra-wide panorama would otherwise collapse the

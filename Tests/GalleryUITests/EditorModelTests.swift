@@ -211,6 +211,43 @@ import GalleryIndexing
         #expect(try await fixture.reader.search("kyoto").first?.item.id == item.id)
     }
 
+    @Test("Batch metadata writes a title into every selected file and can be undone")
+    func batchMetadataWritesAndUndoes() async throws {
+        let fixture = try await Fixture(files: 0)
+        defer { await fixture.tearDown() }
+        try fixture.writeJPEG(named: "one.jpg", width: 320, height: 240)
+        try fixture.writeJPEG(named: "two.jpg", width: 320, height: 240)
+        await fixture.model.start()
+        await fixture.model.add([fixture.media])
+        try await fixture.waitUntilIdle(fixture.coordinator)
+        try await fixture.waitUntil {
+            fixture.model.items.count == 2 && fixture.model.items.allSatisfy { $0.pixelSize != nil }
+        }
+
+        fixture.model.selectAll()
+        await fixture.model.beginBatchMetadata()
+        let session = try #require(fixture.model.batchMetadataSession)
+        session.applyTitle = true
+        session.title = "Kyoto"
+        await fixture.model.applyBatchMetadata()
+
+        for item in fixture.model.items {
+            let row = try #require(await fixture.reader.item(id: item.id))
+            #expect(row.title == "Kyoto")
+            let source = try #require(await fixture.editor.source(for: row))
+            #expect(MetadataEditor.readBack(source.url)?.title == "Kyoto")
+        }
+        #expect(fixture.model.notices.contains { $0.commands.contains(.undoMetadata) })
+
+        await fixture.model.undoLastMetadataChange()
+        for item in fixture.model.items {
+            let row = try #require(await fixture.reader.item(id: item.id))
+            #expect(row.title == nil)
+            let source = try #require(await fixture.editor.source(for: row))
+            #expect(MetadataEditor.readBack(source.url)?.title == nil)
+        }
+    }
+
     @Test("A clip cannot be opened in the editor")
     func clipsAreRefused() async throws {
         let fixture = try await Fixture(files: 5)

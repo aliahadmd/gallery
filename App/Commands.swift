@@ -50,6 +50,12 @@ struct GalleryCommands: Commands {
             Button("Rebuild Search Index") {
                 Task { await model.rebuildSearchIndex() }
             }
+
+            Divider()
+
+            Button("Recategorize Smart Albums") {
+                Task { await model.recategorizeCategories() }
+            }
         }
 
         CommandMenu("Photo") {            Button("Open") {
@@ -74,23 +80,45 @@ struct GalleryCommands: Commands {
             .disabled(!canEditSelection)
 
             Button("Edit Metadata…") {
-                guard let id = model.selectedID else { return }
-                Task { await model.openEditor(id, tool: .metadata) }
+                if model.selectedCount > 1 {
+                    Task { await model.beginBatchMetadata() }
+                } else {
+                    guard let id = model.selectedID else { return }
+                    Task { await model.openEditor(id, tool: .metadata) }
+                }
             }
-            .disabled(!canEditSelection)
+            .disabled(model.selectedCount == 0 || (model.selectedCount == 1 && !canEditSelection))
 
             Button("Export a Copy…") {
-                let ids = model.selectedMediaIDs
-                Task { await ExportPicker.presentBatchExport(ids, into: model) }
+                Task { await ExportPicker.presentBatchExport(into: model) }
             }
             .keyboardShortcut("e", modifiers: [.command, .shift])
-            .disabled(model.selectedItems.allSatisfy { $0.kind != .image })
+            .disabled(model.selectedCount == 0)
 
             Button("Create Collage…") {
                 let ids = model.selectedMediaIDs
                 Task { await model.createCollage(ids) }
             }
             .disabled(model.selectedItems.filter { $0.kind == .image }.count < 2)
+
+            Button("Select Similar") {
+                guard let item = model.selectedItem else { return }
+                Task { await model.selectSimilar(to: item) }
+            }
+            .disabled(model.selectedItem?.kind != .image)
+
+            Divider()
+
+            Button("Rename…") { Task { await model.beginRename() } }
+                .keyboardShortcut("r", modifiers: [.command, .option])
+                .disabled(model.selectedCount == 0 || !model.canRename)
+
+            Button("Move to Folder…") { Task { await model.actions?.moveSelection() } }
+                .disabled(model.selectedCount == 0 || model.actions == nil)
+
+            Button("Undo Rename") { Task { await model.undoLastRename() } }
+                .keyboardShortcut("z", modifiers: [.command, .option])
+                .disabled(model.lastRenameUndo == nil)
 
             Button("Revert to Previous Version") {
                 guard let item = model.selectedItem else { return }
@@ -104,25 +132,39 @@ struct GalleryCommands: Commands {
                 Task { await model.toggleFavoriteSelection() }
             }
             .keyboardShortcut("f", modifiers: [.command, .shift])
-            .disabled(model.selectedIDs.isEmpty)
+            .disabled(model.selectedCount == 0)
 
             // ⌘⌫, not ⌘⇧⌫: the shifted form is macOS's own "empty trash" gesture elsewhere and is reserved.
             // In Recently Deleted the same key is the undo, because that is where the user is.
             Button(model.isRecentlyDeleted ? "Restore" : "Move to Trash") {
-                let ids = model.selectedMediaIDs
                 Task {
                     if model.isRecentlyDeleted {
-                        await model.restore(ids)
+                        await model.restoreSelection()
                     } else {
-                        await model.moveToTrash(ids)
+                        model.requestTrash()
                     }
                 }
             }
             .keyboardShortcut(.delete, modifiers: .command)
-            .disabled(model.selectedIDs.isEmpty)
+            .disabled(model.selectedCount == 0)
 
-            Button("Select All") { model.selectAll() }
+            Button("Select All in Album") { model.selectAll() }
                 .keyboardShortcut("a", modifiers: .command)
+
+            Button("Deselect All") { model.deselectAll() }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+
+            Button("Invert Selection") { model.invertSelection() }
+                .keyboardShortcut("a", modifiers: [.command, .control])
+
+            Divider()
+
+            Button("Copy Names") { Task { await model.copySelectedNames() } }
+                .disabled(model.selectedCount == 0)
+            Button("Copy Paths") { Task { await model.copySelectedPaths() } }
+                .disabled(model.selectedCount == 0)
+            Button("Reveal in Finder") { Task { await model.revealSelection() } }
+                .disabled(model.selectedCount == 0)
         }
     }
 

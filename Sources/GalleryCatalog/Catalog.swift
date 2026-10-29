@@ -24,6 +24,10 @@ public enum CatalogMigrations {
         // than altered, and `Catalog.open` rebuilds it after the step lands.
         Migration(version: 4, name: "v4 titles, backup completion and the eight-column index",
                   up: { try $0.exec(Self.v4) }),
+        // v5 is the curation phase: the cleanup classifier's columns/evidence/feedback, and the journal that
+        // makes a staged rename recoverable. FTS is untouched.
+        Migration(version: 5, name: "v5 categories, feedback and the rename journal",
+                  up: { try $0.exec(Self.v5) }),
     ]
 
     private static let v2 = """
@@ -189,6 +193,57 @@ public enum CatalogMigrations {
       VALUES (new.id, new.name, new.place_key, new.device, new.lens, new.search_text, new.search_tags,
               new.search_ocr, new.title);
     END;
+    """
+
+    /// Appended columns and three new tables. `Schema.create` must leave `media` with the same columns in the
+    /// same order; the migration test compares the two shapes.
+    private static let v5 = """
+    ALTER TABLE media ADD COLUMN category            INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE media ADD COLUMN category_confidence REAL    NOT NULL DEFAULT 0;
+    ALTER TABLE media ADD COLUMN category_stage      INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE media ADD COLUMN category_attempts   INTEGER NOT NULL DEFAULT 0;
+
+    CREATE INDEX media_category_lookup ON media(category, category_confidence DESC, id);
+    CREATE INDEX media_category_pending ON media(category_stage, cap_day DESC, id DESC)
+      WHERE category_stage < 2 AND trash = 0 AND analysis_stage = 2;
+
+    CREATE TABLE media_category (
+      media_id          INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+      stat_hash         INTEGER NOT NULL,
+      version           INTEGER NOT NULL,
+      revision          TEXT    NOT NULL,
+      category          INTEGER NOT NULL,
+      confidence        REAL    NOT NULL,
+      score             REAL    NOT NULL DEFAULT 0,
+      reasons_json      TEXT,
+      sampled_side      INTEGER,
+      has_alpha         INTEGER,
+      transparent_ratio REAL,
+      color_count       INTEGER,
+      flat_ratio        REAL,
+      edge_ratio        REAL,
+      classified_ns     INTEGER NOT NULL
+    ) WITHOUT ROWID;
+
+    CREATE TABLE category_feedback (
+      media_id   INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+      category   INTEGER NOT NULL,
+      verdict    INTEGER NOT NULL,
+      created_ns INTEGER NOT NULL
+    ) WITHOUT ROWID;
+    CREATE INDEX category_feedback_category ON category_feedback(category, verdict);
+
+    CREATE TABLE rename_journal (
+      id         INTEGER PRIMARY KEY,
+      media_id   INTEGER,
+      src_id     INTEGER NOT NULL,
+      parent_rel TEXT    NOT NULL,
+      from_name  TEXT    NOT NULL,
+      temp_name  TEXT    NOT NULL,
+      to_name    TEXT    NOT NULL,
+      created_ns INTEGER NOT NULL
+    );
+    CREATE INDEX rename_journal_parent ON rename_journal(src_id, parent_rel);
     """
 }
 

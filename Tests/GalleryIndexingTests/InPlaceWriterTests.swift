@@ -47,7 +47,7 @@ import GalleryDomain
     try Data("b".utf8).write(to: temp)
     try InPlaceWriter.overwrite(url, with: temp, modificationDate: nil)
 
-    var size = 64
+    let size = 64
     var buffer = [UInt8](repeating: 0, count: size)
     let readBack = getxattr(url.path, name, &buffer, size, 0, 0)
     #expect(readBack == value.count)

@@ -78,6 +78,17 @@ private final class ExportOptionsView: NSView {
 
 extension ExportPicker {
     static func presentBatchExport(_ ids: [MediaID], into model: MediaLibraryModel) async {
+        guard let (folder, policy) = chooseExportFolder() else { return }
+        await model.exportCopies(ids, to: folder, policy: policy)
+    }
+
+    /// The whole selection, including rows the grid has not loaded.
+    static func presentBatchExport(into model: MediaLibraryModel) async {
+        guard let (folder, policy) = chooseExportFolder() else { return }
+        await model.exportSelection(to: folder, policy: policy)
+    }
+
+    private static func chooseExportFolder() -> (URL, ExportNaming.Policy)? {
         let panel = NSOpenPanel()
         panel.title = "Export Copies"
         panel.message = "Choose where the copies go. The originals stay where they are."
@@ -90,9 +101,9 @@ extension ExportPicker {
         let options = ExportOptionsView()
         panel.accessoryView = options
 
-        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        guard panel.runModal() == .OK, let folder = panel.url else { return nil }
         lastFolder = folder
-        await model.exportCopies(ids, to: folder, policy: options.policy)
+        return (folder, options.policy)
     }
 
     static func presentCollageExport(for session: CollageSession, into model: MediaLibraryModel) async {

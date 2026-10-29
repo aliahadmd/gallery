@@ -51,6 +51,7 @@ let package = Package(
             path: "App",
             exclude: ["Info.plist", "Gallery.entitlements"]
         ),
+        .testTarget(name: "GalleryDomainTests", dependencies: ["GalleryDomain"]),
         .testTarget(name: "GallerySQLiteTests", dependencies: ["GallerySQLite"]),
         .testTarget(name: "GallerySupportTests", dependencies: ["GallerySupport"]),
         .testTarget(

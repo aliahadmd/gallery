@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreGraphics
 import Observation
 import GalleryAnalysis
@@ -6,16 +7,84 @@ import GalleryDomain
 import GalleryCatalog
 import GalleryEditing
 import GalleryIndexing
+import GallerySupport
+
+/// A button the notice's alert can offer. A closed enum rather than a closure, so `Notice` stays a value
+/// that is testable and observable.
+public enum NoticeCommand: String, Sendable, Hashable, CaseIterable {
+    case openRecentlyDeleted
+    case showBatchFailures
+    case revealConflicting
+    case undoRename
+    case undoMetadata
+
+    public var title: String {
+        switch self {
+        case .openRecentlyDeleted: "Show Recently Deleted"
+        case .showBatchFailures: "Show Details"
+        case .revealConflicting: "Show Problems"
+        case .undoRename: "Undo Rename"
+        case .undoMetadata: "Undo Metadata Change"
+        }
+    }
+}
 
 /// Something the user should be told about, once, in the UI rather than only in the log.
 public struct Notice: Identifiable, Sendable, Hashable {
     public let id = UUID()
     public var text: String
     public var detail: String?
+    public var commands: [NoticeCommand]
 
-    public init(_ text: String, detail: String? = nil) {
+    public init(_ text: String, detail: String? = nil, commands: [NoticeCommand] = []) {
         self.text = text
         self.detail = detail
+        self.commands = commands
+    }
+}
+
+/// A destructive action waiting for confirmation. The selection is already frozen, so rows scanned while
+/// the dialog is open cannot join it.
+public enum DestructiveAction: Identifiable, Sendable, Hashable {
+    case trash(BatchSelection)
+    case deleteForever(BatchSelection)
+
+    public var id: String {
+        switch self {
+        case .trash(let batch): "trash-\(batch.frozenAt.timeIntervalSince1970)-\(batch.count)"
+        case .deleteForever(let batch): "forever-\(batch.frozenAt.timeIntervalSince1970)-\(batch.count)"
+        }
+    }
+
+    public var selection: BatchSelection {
+        switch self {
+        case .trash(let batch), .deleteForever(let batch): batch
+        }
+    }
+
+    public var count: Int { selection.count }
+
+    public var title: String {
+        switch self {
+        case .trash: "Move to Trash?"
+        case .deleteForever: "Delete Forever?"
+        }
+    }
+
+    public var confirmTitle: String {
+        switch self {
+        case .trash: count == 1 ? "Move to Trash" : "Move \(count) Items to Trash"
+        case .deleteForever: count == 1 ? "Delete Forever" : "Delete \(count) Items Forever"
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .trash:
+            "The files leave their folders and stay recoverable in Recently Deleted for 30 days."
+        case .deleteForever:
+            "This cannot be undone. The files are removed from disk."
+        }
     }
 }
 
@@ -23,9 +92,19 @@ public struct Notice: Identifiable, Sendable, Hashable {
 /// need to know that asking for one is a thing that can happen.
 public struct MediaLibraryActions: Sendable {
     public var exportCopies: @MainActor @Sendable ([MediaID]) async -> Void
+    /// The selection-based export: opens the panel and exports every selected row, including off-page ones.
+    public var exportSelection: @MainActor @Sendable () async -> Void
+    /// A folder panel inside the source, then the move preview.
+    public var moveSelection: @MainActor @Sendable () async -> Void
 
-    public init(exportCopies: @escaping @MainActor @Sendable ([MediaID]) async -> Void) {
+    public init(
+        exportCopies: @escaping @MainActor @Sendable ([MediaID]) async -> Void,
+        exportSelection: @escaping @MainActor @Sendable () async -> Void,
+        moveSelection: @escaping @MainActor @Sendable () async -> Void
+    ) {
         self.exportCopies = exportCopies
+        self.exportSelection = exportSelection
+        self.moveSelection = moveSelection
     }
 }
 
@@ -40,7 +119,14 @@ public struct MediaLibraryActions: Sendable {
 public final class MediaLibraryModel {
     public private(set) var sources: [FolderSource] = []
     public private(set) var items: [MediaItem] = []
-    public private(set) var selection: AlbumKind = .all
+    public private(set) var selection: AlbumKind = .all {
+        didSet {
+            guard selection != oldValue else { return }
+            // The selection belongs to the album: a new scope resets it, whether the change came from the
+            // sidebar or from adding/removing a folder.
+            mediaSelection.reset(album: selection, search: appliedSearch.isEmpty ? nil : appliedSearch)
+        }
+    }
     public private(set) var isLoadingPage = false
     public private(set) var hasMorePages = false
     public private(set) var rowCount = 0
@@ -53,13 +139,31 @@ public final class MediaLibraryModel {
     /// Set by the toolbar's sort menu. A `var` on purpose: it is the user's choice, not derived state.
     public var sort: MediaSort = .default
 
-    /// The tile(s) the user clicked, and the photo the viewer is showing. `selectedID` is the primary — the
-    /// one the inspector describes and Return opens — and `selectedIDs` is everything a batch action touches.
-    /// Ids rather than copied rows: pass B fills in a pixel size minutes after a page lands, and a snapshot
-    /// would leave the inspector describing a row that no longer exists in that shape.
-    public private(set) var selectedIDs: Set<MediaID> = []
-    public private(set) var selectedID: MediaID?
-    private var selectionAnchor: MediaID?
+    /// The selected rows the grid currently draws — what cell rings and single-row commands use. Batch
+    /// actions consume `batchSelection()`, not this set, so an album-wide selection is not lost off-page.
+    public var selectedIDs: Set<MediaID> {
+        Set(items.lazy.filter { self.mediaSelection.contains($0.id) }.map(\.id))
+    }
+
+    /// The primary row: the one the inspector describes and Return opens.
+    public var selectedID: MediaID? { mediaSelection.primary }
+
+    public var selectionAnchorID: MediaID? { mediaSelection.anchor }
+
+    /// What the selection bar says, including the rows the grid has not loaded.
+    public var selectedCount: Int {
+        mediaSelection.count(rowCount: isSearching ? items.count : rowCount)
+    }
+
+    public var isWholeAlbumSelection: Bool { mediaSelection.isWholeAlbum }
+
+    /// The explicit selection in grid order; off-page ids follow in id order.
+    public var orderedSelectedIDs: [MediaID] {
+        mediaSelection.orderedExplicit(page: items.map(\.id))
+    }
+    /// The live selection. A predicate rather than a set: "the whole album" is what makes a thousand-file
+    /// cleanup possible without loading a thousand rows.
+    public private(set) var mediaSelection = MediaSelection()
     public private(set) var viewerID: MediaID?
     /// The photo open in the editor. Nil when the editor is closed; the session lives here rather than in
     /// the view so a SwiftUI rebuild cannot drop an undo stack.
@@ -89,6 +193,8 @@ public final class MediaLibraryModel {
     /// Tag albums from the analysis pass, and the pass's own numbers (kept apart from the drain's so a
     /// finished analysis cannot mask an active scan in the HUD).
     public private(set) var tags: [Album] = []
+    /// The cleanup classifier's shelf: how many rows each category holds right now.
+    public private(set) var categoryCounts: [CategoryCount] = []
     /// Face clusters with enough photos to be a person. Numbered until somebody names them.
     public private(set) var people: [Album] = []
     /// The best shot of every duplicate set, loaded while the Duplicates album is open so a cell can say so.
@@ -130,10 +236,18 @@ public final class MediaLibraryModel {
     /// Nil when the caller does not want a third pass at all — every unit test, and any future build that
     /// ships without Vision. The app always passes one.
     private let analysis: AnalysisWorker?
+    /// The cheap category pass over stored signals. Nil in tests that do not care.
+    private let categorizer: CategoryWorker?
+    private var categoryTask: Task<Void, Never>?
     /// Nil in unit tests and anywhere the editor is not part of the build; the app always passes one.
     private let editor: EditService?
     /// Set by the composition root; nil in tests, which is why every caller treats it as optional.
     public var actions: MediaLibraryActions?
+    /// Rename and Move need the catalog, the resolver and the self-write guard; nil keeps the rest of the
+    /// model usable in tests that do not care about them.
+    private let renameService: RenameService?
+    public private(set) var renameSession: RenameSession?
+    public private(set) var lastRenameUndo: RenameService.Undo?
     private var cursor: SortCursor?
     private var generation = 0
     private var feed: Task<Void, Never>?
@@ -147,7 +261,9 @@ public final class MediaLibraryModel {
     public init(reader: CatalogReader, coordinator: IndexCoordinator, passB: MetadataWorker,
                 thumbnails: ThumbnailService, catalog: Catalog, resolver: any MediaResolving,
                 trashRoot: URL, geocoder: any ReverseGeocoding = AppleGeocoder(),
-                analysis: AnalysisWorker? = nil, editor: EditService? = nil) {
+                analysis: AnalysisWorker? = nil, editor: EditService? = nil,
+                selfWrites: SelfWriteGuard? = nil, rename: RenameService? = nil,
+                categorizer: CategoryWorker? = nil) {
         self.reader = reader
         self.coordinator = coordinator
         self.passB = passB
@@ -155,10 +271,13 @@ public final class MediaLibraryModel {
         self.catalog = catalog
         self.resolver = resolver
         self.players = PlayerPool(resolver: resolver)
-        self.trash = TrashService(catalog: catalog, resolver: resolver, root: trashRoot)
+        self.trash = TrashService(catalog: catalog, resolver: resolver, root: trashRoot,
+                                 selfWrites: selfWrites)
         self.locations = LocationDeriver(catalog: catalog, geocoder: geocoder)
         self.analysis = analysis
         self.editor = editor
+        self.renameService = rename
+        self.categorizer = categorizer
     }
 
     // MARK: - Lifecycle
@@ -185,6 +304,7 @@ public final class MediaLibraryModel {
                     await self.refreshAlbums()
                     await self.refreshPlaces()
                     await self.reload()
+                    self.startCategoryPass()
                 }
             }
         }
@@ -204,6 +324,9 @@ public final class MediaLibraryModel {
                         // for a count nobody can watch climb.
                         await self.refreshTags()
                         await self.reload()
+                        // New analysis results are new category inputs; the cheap pass re-runs once the
+                        // analyser stops, so a fresh screenshot reaches the Cleanup shelf without a relaunch.
+                        self.startCategoryPass()
                     }
                 }
             }
@@ -235,8 +358,18 @@ public final class MediaLibraryModel {
         // whose first pages could already have posters.
         await passB.start()
         await analysis?.start()
+        startCategoryPass()
         try? await catalog.pruneDuplicateGroups()
         await purgeExpiredTrash()
+        if let renameService {
+            let recovered = await renameService.recoverStagedMoves()
+            if recovered > 0 {
+                notices.append(Notice(
+                    recovered == 1 ? "A rename interrupted by a crash was rolled back."
+                                   : "\(recovered) interrupted renames were rolled back."
+                ))
+            }
+        }
         if let editor {
             let interrupted = await editor.recoverInterruptedEdits()
             if interrupted > 0 {
@@ -274,6 +407,63 @@ public final class MediaLibraryModel {
     public func refreshTags() async {
         tags = (try? await reader.tagAlbums()) ?? []
         people = (try? await reader.peopleAlbums()) ?? []
+        categoryCounts = ((try? await reader.categoryCounts()) ?? [])
+            .filter { MediaCategory.cleanupShelf.contains($0.category) }
+    }
+
+    // MARK: - Categories
+
+    /// One category pass at a time, started at launch and again whenever a drain or the analyser finishes.
+    private func startCategoryPass() {
+        guard let categorizer, categoryTask == nil else { return }
+        categoryTask = Task { [weak self] in
+            let count = await categorizer.runOnce()
+            guard let self else { return }
+            self.categoryTask = nil
+            guard count > 0 else { return }
+            await self.refreshTags()
+            await self.reload()
+            Log.analysis.info("categories: \(count) rows classified")
+        }
+    }
+
+    public func categoryEvidence(for id: MediaID) async -> CategoryEvidence? {
+        (try? await reader.categoryEvidence(ids: [id]))?[id]
+    }
+
+    public enum CategoryFeedback: Sendable {
+        case exclude
+        case confirm(MediaCategory)
+        case automatic
+    }
+
+    /// The accuracy loop: one verdict per photo, applied to the album query immediately.
+    public func setCategoryFeedback(_ feedback: CategoryFeedback, for item: MediaItem) async {
+        do {
+            switch feedback {
+            case .exclude:
+                try await catalog.setCategoryFeedback(
+                    mediaID: item.id, category: item.category, verdict: -1
+                )
+            case .confirm(let category):
+                try await catalog.setCategoryFeedback(mediaID: item.id, category: category, verdict: 1)
+            case .automatic:
+                try await catalog.clearCategoryFeedback(mediaID: item.id)
+            }
+            await refreshTags()
+            await reload()
+        } catch {
+            notices.append(Notice("The category feedback could not be saved.", detail: "\(error)"))
+        }
+    }
+
+    /// Re-runs the classifier over stored signals; no Vision, no decodes except the graphic samples.
+    public func recategorizeCategories() async {
+        guard let categorizer else { return }
+        let count = await categorizer.resetAndRun()
+        await refreshTags()
+        await reload()
+        notices.append(Notice("Smart albums rebuilt.", detail: "\(count) photos classified."))
     }
 
     /// A person's name is the user's, and a re-analysis never overwrites it: renaming writes the row the
@@ -388,6 +578,10 @@ public final class MediaLibraryModel {
         editingSession = nil
         collageSession?.cancel()
         collageSession = nil
+        renameSession = nil
+        lastRenameUndo = nil
+        categoryTask?.cancel()
+        categoryTask = nil
         feed?.cancel()
         feed = nil
         previewFeed?.cancel()
@@ -402,10 +596,12 @@ public final class MediaLibraryModel {
         let cache = thumbnails
         let walk = coordinator
         let analyser = analysis
+        let classifier = categorizer
         Task {
             await walk.stopAllWatching()
             await worker.cancel()
             await analyser?.cancel()
+            await classifier?.cancel()
             await cache.clearWindow()
         }
     }
@@ -496,9 +692,7 @@ public final class MediaLibraryModel {
         selection = album
         // The rows behind the viewer are about to be a different set; a selection that survived would be a
         // photo the user can no longer see. A search belongs to the album it was typed in, so it goes too.
-        selectedIDs = []
-        selectedID = nil
-        selectionAnchor = nil
+        mediaSelection.reset(album: album, search: nil)
         viewerID = nil
         clearSearch()
         // The old album's rows must not sit under the new album's title for even one frame.
@@ -519,20 +713,21 @@ public final class MediaLibraryModel {
             guard isSearching else { return }
             appliedSearch = ""
             searchSnippets = [:]
+            mediaSelection.reset(album: selection, search: nil)
             Task { await self.reload() }
             return
         }
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(200))
             guard !Task.isCancelled else { return }
-            await self?.runSearch(query)
+            await self?.runSearch(query, resetSelection: true)
         }
     }
 
     /// Search is scoped to the album it was typed in: the field sits in that album's toolbar, and a filter
     /// that silently reached across the whole library would make "Problems" and "Favorites" mean nothing.
     /// Selecting "All Media" is how the user asks for the whole library.
-    private func runSearch(_ query: String) async {
+    private func runSearch(_ query: String, resetSelection: Bool = false) async {
         generation += 1
         let stamp = generation
         do {
@@ -546,10 +741,13 @@ public final class MediaLibraryModel {
             rowCount = items.count
             searchSnippets = Dictionary(hits.map { ($0.item.id, $0.snippet) },
                                         uniquingKeysWith: { first, _ in first })
-            // The rows behind the results are a different set, so a selection from the previous query is
-            // not something the user can still see.
-            selectedIDs = selectedIDs.intersection(Set(items.map(\.id)))
-            if let selectedID, !selectedIDs.contains(selectedID) { self.selectedID = selectedIDs.first }
+            // A new query is a new scope; a reload with the same query only prunes the explicit selection to
+            // the rows that still match.
+            if resetSelection {
+                mediaSelection.reset(album: selection, search: query)
+            } else {
+                mediaSelection.keep(only: Set(items.map(\.id)))
+            }
             visibleCells = visibleCells.intersection(Set(items.map(\.id)))
         } catch {
             guard stamp == generation else { return }
@@ -600,12 +798,12 @@ public final class MediaLibraryModel {
             // just because SwiftUI kept its view alive. Without this the window keeps prefetching pictures
             // the user switched away from.
             let stillOnScreen = Set(page.items.map(\.id))
-            // A selection (or a known file URL) that is no longer on the page is a row the user cannot act
-            // on; keeping it would make ⌘⌫ delete something that is not visible.
-            selectedIDs = selectedIDs.intersection(stillOnScreen)
-            if let selectedID, !stillOnScreen.contains(selectedID) { self.selectedID = selectedIDs.first }
-            if let anchor = selectionAnchor, !stillOnScreen.contains(anchor) {
-                selectionAnchor = selectedIDs.first
+            // An explicit selection is pruned against the *album*, not the page: a photo on page 9 is still
+            // selected while page 1 is on screen. A whole-album selection is defined by the predicate and
+            // needs no pruning.
+            if let explicit = mediaSelection.explicitIDs, !explicit.isEmpty {
+                let alive = (try? await reader.ids(in: mediaSelection.album, among: Array(explicit))) ?? []
+                mediaSelection.keep(only: alive)
             }
             knownURLs = knownURLs.filter { stillOnScreen.contains($0.key) }
             let leftTheAlbum = visibleCells.subtracting(stillOnScreen)
@@ -708,53 +906,88 @@ public final class MediaLibraryModel {
         return items.first { $0.id == viewerID }
     }
 
-    /// A click, ⌘-click or ⇧-click. The anchor is the last row clicked without ⇧ — the range a ⇧-click
-    /// extends from is the one the user built up, not the alphabetically nearest one.
+    /// A click, ⌘-click or ⇧-click. The transition lives in `MediaSelection`, where it is testable without a
+    /// grid; the anchor is the last row clicked without ⇧.
     public func select(_ id: MediaID?, extending: Bool = false, range: Bool = false) {
         guard let id, items.contains(where: { $0.id == id }) else {
-            selectedIDs = []
-            selectedID = nil
-            selectionAnchor = nil
+            mediaSelection.deselectAll()
             return
         }
-        if range, let anchor = selectionAnchor,
-           let start = items.firstIndex(where: { $0.id == anchor }),
-           let end = items.firstIndex(where: { $0.id == id }) {
-            let bounds = start <= end ? start...end : end...start
-            selectedIDs = Set(items[bounds].map(\.id))
-            selectedID = id
-        } else if extending {
-            if selectedIDs.contains(id) {
-                selectedIDs.remove(id)
-                if selectedID == id { selectedID = selectedIDs.isEmpty ? nil : items.last { selectedIDs.contains($0.id) }?.id }
-            } else {
-                selectedIDs.insert(id)
-                selectedID = id
-            }
-            selectionAnchor = id
+        mediaSelection.click(id, page: items.map(\.id), command: extending, shift: range)
+    }
+
+    /// ⌘A. The whole album (the user asked for bulk cleanup, and every destructive action confirms its
+    /// count), or the loaded hits while a search is on — search is capped at 500.
+    public func selectAll() {
+        if isSearching {
+            mediaSelection.selectAllLoaded(items.map(\.id))
         } else {
-            selectedIDs = [id]
-            selectedID = id
-            selectionAnchor = id
+            mediaSelection.selectAllInAlbum()
+            mediaSelection.setPrimary(items.first?.id)
         }
     }
 
-    /// ⌘A. The whole loaded page, not the whole library: a shortcut that silently selected a hundred
-    /// thousand rows the grid has never drawn would make ⌘⌫ unthinkable.
-    public func selectAll() {
-        guard !items.isEmpty else { return }
-        selectedIDs = Set(items.map(\.id))
-        selectedID = items.first?.id
-        selectionAnchor = items.first?.id
+    public func deselectAll() {
+        mediaSelection.deselectAll()
+    }
+
+    public func invertSelection() {
+        mediaSelection.invert()
+    }
+
+    public func marqueeSelect(_ ids: [MediaID], command: Bool, shift: Bool) {
+        mediaSelection.marquee(ids, command: command, shift: shift)
+    }
+
+    /// The frozen value a batch action consumes. Explicit selections keep grid order so a rename sequence
+    /// follows what the user sees.
+    public func batchSelection() -> BatchSelection? {
+        var batch = mediaSelection.batchSelection(rowCount: isSearching ? items.count : rowCount)
+        if batch?.explicit != nil {
+            batch?.explicit = orderedSelectedIDs
+        }
+        return batch
+    }
+
+    /// Freezes the boundary at the moment the user confirmed: rows scanned afterwards are not swept in.
+    public func frozenSelection() async -> BatchSelection? {
+        guard var batch = batchSelection() else { return nil }
+        batch = batch.frozen(upperBound: try? await reader.maxMediaID())
+        return batch
+    }
+
+    /// Resolves a selection into rows in pages. Explicit ids are fetched in chunks; a whole album is walked
+    /// by id with the frozen upper bound, advancing the cursor even when a page is fully excluded.
+    public func resolveRows(_ batch: BatchSelection, limit: Int = 20_000) async -> [MediaItem] {
+        if let explicit = batch.explicit {
+            var rows: [MediaItem] = []
+            var index = 0
+            while index < explicit.count, rows.count < limit {
+                let chunk = Array(explicit[index..<min(index + 500, explicit.count)])
+                rows += (try? await reader.items(ids: chunk)) ?? []
+                index += chunk.count
+            }
+            return rows
+        }
+        var rows: [MediaItem] = []
+        var cursor: MediaID?
+        while rows.count < limit {
+            let page = (try? await reader.items(
+                album: batch.album, after: cursor, upperBound: batch.upperBound, limit: 500
+            )) ?? []
+            guard let last = page.last else { break }
+            rows += page.filter { !batch.excluded.contains($0.id) }
+            cursor = last.id
+            if page.count < 500 { break }
+        }
+        return rows
     }
 
     /// Double-click, or Return on the selection. Selection follows the viewer, so closing it leaves the
     /// inspector on the photo the user was just looking at.
     public func openViewer(_ id: MediaID) {
         guard items.contains(where: { $0.id == id }) else { return }
-        selectedIDs = [id]
-        selectedID = id
-        selectionAnchor = id
+        mediaSelection.selectOnly(id)
         viewerID = id
     }
 
@@ -776,9 +1009,7 @@ public final class MediaLibraryModel {
         let next = min(max(landed + delta, 0), items.count - 1)
         guard next != landed else { return }
         self.viewerID = items[next].id
-        selectedIDs = [items[next].id]
-        selectedID = items[next].id
-        selectionAnchor = self.viewerID
+        mediaSelection.selectOnly(items[next].id)
         // Whatever the previous step opened is stopped before its layer is replaced.
         players.evict(except: self.viewerID)
     }
@@ -831,9 +1062,7 @@ public final class MediaLibraryModel {
             notices.append(Notice("The file behind “\(item.name)” could not be found."))
             return
         }
-        selectedIDs = [id]
-        selectedID = id
-        selectionAnchor = id
+        mediaSelection.selectOnly(id)
         let session = EditingSession(
             source: source, storedSize: stored, orientation: item.orientation ?? 1, service: editor
         )
@@ -993,8 +1222,20 @@ public final class MediaLibraryModel {
     public func exportCopies(
         _ ids: [MediaID], to folder: URL, policy: ExportNaming.Policy
     ) async {
+        await exportRows(items.filter { ids.contains($0.id) }, to: folder, policy: policy)
+    }
+
+    /// Export every photo in the current selection, including the rows the grid has not loaded.
+    public func exportSelection(to folder: URL, policy: ExportNaming.Policy) async {
+        guard let batch = batchSelection() else { return }
+        await exportRows(await resolveRows(batch), to: folder, policy: policy)
+    }
+
+    private func exportRows(
+        _ rows: [MediaItem], to folder: URL, policy: ExportNaming.Policy
+    ) async {
         guard let editor else { return }
-        let chosen = items.filter { ids.contains($0.id) && $0.kind == .image }
+        let chosen = rows.filter { $0.kind == .image }
         guard !chosen.isEmpty else {
             notices.append(Notice("There are no photos in this selection to export."))
             return
@@ -1062,12 +1303,14 @@ public final class MediaLibraryModel {
 
     /// The toolbar's star when more than one row is selected: all favorite, or all unfavorite.
     public func toggleFavoriteSelection() async {
-        let chosen = selectedItems
-        guard !chosen.isEmpty else { return }
-        let wanted = !chosen.allSatisfy(\.isFavorite)
+        guard let batch = batchSelection() else { return }
+        let rows = await resolveRows(batch)
+        guard !rows.isEmpty else { return }
+        let wanted = !rows.allSatisfy(\.isFavorite)
         do {
-            try await catalog.setFavorites(chosen.map(\.id), wanted)
-            for index in items.indices where selectedIDs.contains(items[index].id) {
+            try await catalog.setFavorites(rows.map(\.id), wanted)
+            let changed = Set(rows.map(\.id))
+            for index in items.indices where changed.contains(items[index].id) {
                 items[index].isFavorite = wanted
             }
         } catch {
@@ -1113,6 +1356,469 @@ public final class MediaLibraryModel {
         await refreshAlbums()
     }
 
+    // MARK: - Batch selection actions
+
+    public private(set) var batchSession: BatchSession?
+    public var isBatching: Bool { batchSession != nil }
+    public private(set) var lastBatchFailures: [BatchSession.Failure] = []
+    public var isShowingBatchFailures = false
+    public private(set) var pendingDestructive: DestructiveAction?
+
+    /// The confirmed half of the destructive flow. The toolbar and ⌘⌫ call this, the dialog calls
+    /// `confirmDestructive`.
+    public func requestTrash() {
+        Task {
+            guard let frozen = await frozenSelection() else { return }
+            pendingDestructive = .trash(frozen)
+        }
+    }
+
+    public func requestDeleteForever() {
+        Task {
+            guard let frozen = await frozenSelection() else { return }
+            pendingDestructive = .deleteForever(frozen)
+        }
+    }
+
+    public func confirmDestructive() {
+        guard let action = pendingDestructive else { return }
+        pendingDestructive = nil
+        Task {
+            switch action {
+            case .trash(let batch): await executeTrash(batch)
+            case .deleteForever(let batch): await executeDeleteForever(batch)
+            }
+        }
+    }
+
+    public func cancelDestructive() {
+        pendingDestructive = nil
+    }
+
+    public func dismissBatchFailures() {
+        isShowingBatchFailures = false
+    }
+
+    public func cancelBatch() {
+        batchSession?.cancel()
+    }
+
+    public func perform(_ command: NoticeCommand) {
+        dismissNotice()
+        switch command {
+        case .openRecentlyDeleted:
+            Task { await select(.recentlyDeleted) }
+        case .showBatchFailures:
+            isShowingBatchFailures = !lastBatchFailures.isEmpty
+        case .revealConflicting:
+            Task { await select(.problems) }
+        case .undoRename:
+            Task { await undoLastRename() }
+        case .undoMetadata:
+            Task { await undoLastMetadataChange() }
+        }
+    }
+
+    /// Direct entry points for tests and for actions that are already confirmed by their own sheet.
+    public func trashSelection() async {
+        guard let frozen = await frozenSelection() else { return }
+        await executeTrash(frozen)
+    }
+
+    public func restoreSelection() async {
+        guard let frozen = await frozenSelection() else { return }
+        await executeRestore(frozen)
+    }
+
+    public func deleteForeverSelection() async {
+        guard let frozen = await frozenSelection() else { return }
+        await executeDeleteForever(frozen)
+    }
+
+    private func executeTrash(_ batch: BatchSelection) async {
+        let rows = await resolveRows(batch)
+        guard !rows.isEmpty else { return }
+        let result = await runBatch(.trash, rows: rows) { row in
+            let outcome = await self.trash.trash([row])
+            return outcome.failed[row.id]
+        }
+        if let viewerID, rows.contains(where: { $0.id == viewerID }) { closeViewer() }
+        mediaSelection.subtract(result.succeeded)
+        if !result.succeeded.isEmpty {
+            await reload()
+            await refreshAlbums()
+        }
+        reportBatch(result.failures, what: "delete")
+    }
+
+    private func executeRestore(_ batch: BatchSelection) async {
+        let rows = await resolveRows(batch)
+        guard !rows.isEmpty else { return }
+        let result = await runBatch(.restore, rows: rows) { row in
+            let outcome = await self.trash.restore([row])
+            return outcome.failed[row.id]
+        }
+        if let viewerID, rows.contains(where: { $0.id == viewerID }) { closeViewer() }
+        mediaSelection.subtract(result.succeeded)
+        if !result.succeeded.isEmpty {
+            await reload()
+            await refreshAlbums()
+        }
+        reportBatch(result.failures, what: "restore")
+    }
+
+    private func executeDeleteForever(_ batch: BatchSelection) async {
+        let rows = await resolveRows(batch)
+        guard !rows.isEmpty else { return }
+        let result = await runBatch(.deleteForever, rows: rows) { row in
+            let outcome = await self.trash.purge([row])
+            return outcome.failed[row.id]
+        }
+        if let viewerID, rows.contains(where: { $0.id == viewerID }) { closeViewer() }
+        mediaSelection.subtract(result.succeeded)
+        if !result.succeeded.isEmpty {
+            await reload()
+            await refreshAlbums()
+        }
+        reportBatch(result.failures, what: "delete forever")
+    }
+
+    /// One item at a time, one session, one Cancel flag. The services already treat a single item as a unit,
+    /// so the loop is where progress and cancellation belong.
+    private func runBatch(
+        _ kind: BatchSession.Kind, rows: [MediaItem], operation: (MediaItem) async -> String?
+    ) async -> (succeeded: [MediaID], failures: [BatchSession.Failure]) {
+        let session = BatchSession(kind: kind, total: rows.count)
+        batchSession = session
+        var succeeded: [MediaID] = []
+        for row in rows {
+            if session.isCancelling || Task.isCancelled { break }
+            session.begin(row.name)
+            let error = await operation(row)
+            session.record(row, error: error)
+            if error == nil { succeeded.append(row.id) }
+        }
+        lastBatchFailures = session.failures
+        batchSession = nil
+        return (succeeded, session.failures)
+    }
+
+    private func reportBatch(_ failures: [BatchSession.Failure], what: String) {
+        guard !failures.isEmpty else { return }
+        notices.append(Notice(
+            failures.count == 1 ? "One item could not \(what)."
+                               : "\(failures.count) items could not \(what).",
+            detail: failures.first?.reason,
+            commands: [.showBatchFailures]
+        ))
+    }
+
+    // MARK: - Batch metadata
+
+    public private(set) var batchMetadataSession: BatchMetadataSession?
+    private struct MetadataUndo {
+        var overrides: [MediaID: MetadataOverrides]
+    }
+    private var lastMetadataUndo: MetadataUndo?
+
+    public func beginBatchMetadata() async {
+        guard let batch = batchSelection(), batch.count > 0 else { return }
+        batchMetadataSession = BatchMetadataSession(count: batch.count)
+    }
+
+    public func closeBatchMetadata() {
+        batchMetadataSession = nil
+    }
+
+    public func applyBatchMetadata() async {
+        guard let editor, let session = batchMetadataSession,
+              let overrides = session.overrides, let batch = batchSelection() else { return }
+        closeBatchMetadata()
+        let rows = await resolveRows(batch)
+        var reverse: [MediaID: MetadataOverrides] = [:]
+        let result = await runBatch(.metadata, rows: rows) { row in
+            guard let source = await editor.source(for: row) else {
+                return "The file could not be found."
+            }
+            let before = await editor.metadata(for: source)
+            let outcome = await editor.applyMetadata(overrides, to: row)
+            if outcome.written {
+                reverse[row.id] = Self.reverseOverrides(before: before, forward: overrides)
+            }
+            return outcome.written ? nil : (outcome.message ?? "The metadata could not be written.")
+        }
+        lastMetadataUndo = reverse.isEmpty ? nil : MetadataUndo(overrides: reverse)
+        lastBatchFailures = result.failures
+        await refreshAlbums()
+        await refreshPlaces()
+        await reload()
+        var commands: [NoticeCommand] = []
+        if !result.failures.isEmpty { commands.append(.showBatchFailures) }
+        if lastMetadataUndo != nil { commands.append(.undoMetadata) }
+        notices.append(Notice(
+            "Metadata written to \(result.succeeded.count) file\(result.succeeded.count == 1 ? "" : "s").",
+            detail: result.failures.first?.reason,
+            commands: commands
+        ))
+    }
+
+    public func undoLastMetadataChange() async {
+        guard let editor, let undo = lastMetadataUndo else { return }
+        lastMetadataUndo = nil
+        let rows = (try? await reader.items(ids: Array(undo.overrides.keys))) ?? []
+        var failures: [BatchSession.Failure] = []
+        for row in rows {
+            guard let overrides = undo.overrides[row.id] else { continue }
+            let outcome = await editor.applyMetadata(overrides, to: row)
+            if !outcome.written {
+                failures.append(BatchSession.Failure(
+                    mediaID: row.id, name: row.name,
+                    reason: outcome.message ?? "Could not restore the previous metadata"
+                ))
+            }
+        }
+        lastBatchFailures = failures
+        await refreshAlbums()
+        await refreshPlaces()
+        await reload()
+        notices.append(Notice(
+            "The previous metadata was restored.", detail: failures.first?.reason,
+            commands: failures.isEmpty ? [] : [.showBatchFailures]
+        ))
+    }
+
+    private static func reverseOverrides(
+        before: ExistingMetadata, forward: MetadataOverrides
+    ) -> MetadataOverrides {
+        var result = MetadataOverrides()
+        if !forward.title.isUnchanged {
+            result.title = before.title.map { .set($0) } ?? .clear
+        }
+        if !forward.capture.isUnchanged {
+            result.capture = before.captureInstant.map {
+                .set(CaptureEdit(instant: $0, offsetSeconds: before.offsetSeconds))
+            } ?? .clear
+        }
+        if !forward.gps.isUnchanged {
+            result.gps = before.gps.map { .set($0) } ?? .clear
+        }
+        return result
+    }
+
+    // MARK: - Select Similar
+
+    /// Visually similar stills from the stored perceptual hash, selected as an explicit set. It switches to
+    /// All Media first so the user can see what was selected.
+    public func selectSimilar(to item: MediaItem) async {
+        guard let hash = try? await reader.dhash(for: item.id) else {
+            notices.append(Notice(
+                "This photo has not been analysed yet.",
+                detail: "Select Similar uses the perceptual hash from the analysis pass."
+            ))
+            return
+        }
+        let matches = (try? await reader.similarIDs(to: hash)) ?? []
+        let ids = matches.map(\.id).filter { $0 != item.id }
+        guard !ids.isEmpty else {
+            notices.append(Notice("No similar photos were found."))
+            return
+        }
+        if selection != .all { await select(.all) }
+        mediaSelection.marquee(ids, command: false, shift: false)
+        mediaSelection.setPrimary(ids.first)
+        notices.append(Notice(ids.count == 1
+            ? "One similar photo selected."
+            : "\(ids.count) similar photos selected."))
+    }
+
+    // MARK: - Rename and Move
+
+    public var canRename: Bool { renameService != nil }
+
+    public func beginRename() async {
+        await prepareRename(rule: RenameRule())
+    }
+
+    public func beginMove(toRelativeFolder folder: String) async {
+        await prepareRename(rule: RenameRule(destinationFolder: folder))
+    }
+
+    public func closeRename() {
+        renameSession = nil
+    }
+
+    /// The root a move dialog should open at, or nil when the selection spans sources (which rename and
+    /// move refuse on purpose: a relative path means different folders in different libraries).
+    public func moveRoot() async -> URL? {
+        guard let batch = batchSelection() else { return nil }
+        let rows = await resolveRows(batch, limit: 50)
+        guard let first = rows.first, Set(rows.map(\.sourceID)).count == 1 else { return nil }
+        if let source = sources.first(where: { $0.id == first.sourceID }) { return source.rootURL }
+        let targets = await resolver.targets(for: [first.id])
+        guard let target = targets[first.id] else { return nil }
+        return Self.sourceRoot(for: target, relativePath: first.relativePath)
+    }
+
+    private func prepareRename(rule: RenameRule) async {
+        guard renameService != nil, let batch = batchSelection() else { return }
+        let rows = await resolveRows(batch)
+        guard !rows.isEmpty else { return }
+        guard Set(rows.map(\.sourceID)).count == 1 else {
+            notices.append(Notice("Rename and Move work inside one folder's library. Narrow the selection."))
+            return
+        }
+
+        // Live Photo halves move as one unit: renaming the still alone would break the pair on the next walk.
+        let stills = rows.filter { $0.subtype.contains(.livePhoto) }
+        let companions = (try? await reader.liveCompanions(of: stills.map(\.id))) ?? [:]
+        var allRows = rows
+        let selected = Set(rows.map(\.id))
+        let missing = companions.values.filter { !selected.contains($0) }
+        if !missing.isEmpty {
+            allRows += (try? await reader.items(ids: missing)) ?? []
+        }
+
+        let targets = await resolver.targets(for: allRows.map(\.id))
+        var namesByParent: [String: Set<String>] = [:]
+        var root: URL?
+        for row in allRows {
+            guard let target = targets[row.id] else { continue }
+            let parentURL = target.url.deletingLastPathComponent()
+            namesByParent[row.parentDirectory] = Set(
+                (try? FileManager.default.contentsOfDirectory(atPath: parentURL.path)) ?? []
+            )
+            if root == nil { root = Self.sourceRoot(for: target, relativePath: row.relativePath) }
+        }
+        if let destination = rule.destinationFolder, let root {
+            let url = destination.isEmpty ? root : root.appendingPathComponent(destination)
+            namesByParent[destination] = Set(
+                (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+            )
+        }
+
+        let subjects = allRows.map { row -> RenameSubject in
+            let isCompanion = row.subtype.contains(.livePhotoCompanion)
+            let stillID: MediaID? = isCompanion
+                ? companions.first(where: { $0.value == row.id })?.key
+                : nil
+            let groupKey: String? = {
+                if let stillID { return "live:\(stillID.rawValue)" }
+                if companions[row.id] != nil { return "live:\(row.id.rawValue)" }
+                return nil
+            }()
+            return RenameSubject(
+                mediaID: row.id, sourceID: row.sourceID, relativePath: row.relativePath,
+                parentRelativePath: row.parentDirectory, name: row.name,
+                captureDate: row.capture?.instant,
+                isLivePhotoStill: row.subtype.contains(.livePhoto),
+                isLivePhotoCompanion: isCompanion,
+                groupKey: groupKey,
+                hasFileIdentity: row.identity.documentID != nil || row.identity.resourceID != nil,
+                isOffline: row.isOffline,
+                inTrash: row.trash != .live
+            )
+        }
+        renameSession = RenameSession(subjects: subjects, existingNames: namesByParent, rule: rule)
+    }
+
+    public func applyRename(_ session: RenameSession) async {
+        guard let renameService else { return }
+        let plan = session.plan
+        guard !plan.moves.isEmpty else {
+            closeRename()
+            return
+        }
+        let isMove = plan.moves.contains { $0.fromParent != $0.toParent }
+        let batch = BatchSession(kind: isMove ? .move : .rename, total: plan.moves.count)
+        batchSession = batch
+        let outcome = await renameService.execute(plan) { done, _ in
+            Task { @MainActor in batch.advance(to: done) }
+        }
+        batchSession = nil
+        lastRenameUndo = outcome.undo
+        let names = Dictionary(session.subjects.map { ($0.mediaID, $0.name) },
+                               uniquingKeysWith: { first, _ in first })
+        lastBatchFailures = outcome.failed.map { id, reason in
+            BatchSession.Failure(mediaID: id, name: names[id] ?? "", reason: reason)
+        }
+        closeRename()
+        await reload()
+        await refreshSources()
+        await refreshAlbums()
+        var commands: [NoticeCommand] = []
+        if !lastBatchFailures.isEmpty { commands.append(.showBatchFailures) }
+        if outcome.undo != nil { commands.append(.undoRename) }
+        notices.append(Notice(
+            isMove
+                ? (outcome.moved.count == 1 ? "Moved one file." : "Moved \(outcome.moved.count) files.")
+                : (outcome.moved.count == 1 ? "Renamed one file." : "Renamed \(outcome.moved.count) files."),
+            detail: lastBatchFailures.first?.reason,
+            commands: commands
+        ))
+    }
+
+    public func undoLastRename() async {
+        guard let renameService, let undo = lastRenameUndo else { return }
+        lastRenameUndo = nil
+        let outcome = await renameService.undo(undo)
+        lastBatchFailures = outcome.failed.map { id, reason in
+            BatchSession.Failure(mediaID: id, name: "", reason: reason)
+        }
+        await reload()
+        await refreshSources()
+        await refreshAlbums()
+        notices.append(Notice(
+            outcome.moved.isEmpty ? "Nothing was restored." : "The rename was undone.",
+            detail: lastBatchFailures.first?.reason,
+            commands: lastBatchFailures.isEmpty ? [] : [.showBatchFailures]
+        ))
+    }
+
+    private static func sourceRoot(for target: MediaTarget, relativePath: String) -> URL {
+        if let scoped = target.scopedRoot { return scoped }
+        var url = target.url
+        for _ in relativePath.split(separator: "/") { url.deleteLastPathComponent() }
+        return url
+    }
+
+    // MARK: - Clipboard and Finder
+
+    public func isInSelection(_ item: MediaItem) -> Bool {
+        selectedCount > 1 && mediaSelection.contains(item.id)
+    }
+
+    public func copySelectedNames() async {
+        guard let batch = batchSelection() else { return }
+        let rows = await resolveRows(batch)
+        guard !rows.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(rows.map(\.name).joined(separator: "\n"), forType: .string)
+        notices.append(Notice(rows.count == 1 ? "Copied the name." : "Copied \(rows.count) names."))
+    }
+
+    public func copySelectedPaths() async {
+        guard let batch = batchSelection() else { return }
+        let rows = await resolveRows(batch)
+        let targets = await resolver.targets(for: rows.map(\.id))
+        let paths = rows.compactMap { targets[$0.id]?.url.path }
+        guard !paths.isEmpty else {
+            notices.append(Notice("The selected files could not be found."))
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(paths.joined(separator: "\n"), forType: .string)
+        notices.append(Notice(paths.count == 1 ? "Copied the path." : "Copied \(paths.count) paths."))
+    }
+
+    public func revealSelection() async {
+        guard let batch = batchSelection() else { return }
+        let rows = await resolveRows(batch)
+        let targets = await resolver.targets(for: rows.map(\.id))
+        let urls = rows.compactMap { targets[$0.id]?.url }
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
     /// The monthly sweep behind "Recently Deleted", run at launch. Silent: there is nothing to tell the user
     /// about a file they asked to delete a month ago.
     private func purgeExpiredTrash() async {
@@ -1133,6 +1839,11 @@ public final class MediaLibraryModel {
     }
 
     // MARK: - Notices
+
+    /// A public way for the App target to surface something the model noticed (the move panel's refusals).
+    public func note(_ text: String, detail: String? = nil) {
+        notices.append(Notice(text, detail: detail))
+    }
 
     public func dismissNotice() {
         guard !notices.isEmpty else { return }

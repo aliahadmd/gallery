@@ -5,7 +5,7 @@ import GallerySQLite
 /// can fail at runtime has no business standing between the app and its index.
 public enum Schema {
     /// Bump only together with an appended `Migration`.
-    public static let version: Int32 = 4
+    public static let version: Int32 = 5
 
     /// A fresh install gets this; an existing library gets `migrations` applied on top of its own version.
     public static let create = """
@@ -79,7 +79,12 @@ public enum Schema {
       search_ocr        TEXT,
       -- A title the user wrote, written into the file and re-derived by pass B. Appended, not inserted:
       -- FTS column order is positional and every weight in `CatalogReader.search` names an index.
-      title             TEXT
+      title             TEXT,
+      -- The cleanup classifier's verdict, denormalised so counts and album queries are a plain index scan.
+      category            INTEGER NOT NULL DEFAULT 0,
+      category_confidence REAL    NOT NULL DEFAULT 0,
+      category_stage      INTEGER NOT NULL DEFAULT 0,
+      category_attempts   INTEGER NOT NULL DEFAULT 0
     );
 
     -- Identity, not path, is the primary key of a photograph. Two files that swap names inside one
@@ -110,6 +115,9 @@ public enum Schema {
       WHERE analysis_stage < 2 AND trash = 0;
     CREATE INDEX media_aesthetic ON media(aesthetic DESC, id DESC);
     CREATE INDEX media_folder_cover ON media(src_id, parent_rel, aesthetic DESC, id DESC);
+    CREATE INDEX media_category_lookup ON media(category, category_confidence DESC, id);
+    CREATE INDEX media_category_pending ON media(category_stage, cap_day DESC, id DESC)
+      WHERE category_stage < 2 AND trash = 0 AND analysis_stage = 2;
 
     -- Favorites are a set of ids, not a column on the big table: toggling one must not rewrite a media
     -- row, and the upsert that follows a rename must not be able to lose one.
@@ -271,6 +279,49 @@ public enum Schema {
       PRIMARY KEY (group_id, media_id)
     );
     CREATE INDEX duplicate_member_media ON duplicate_member(media_id);
+
+    -- The classifier's evidence, one row per photo. `reasons_json` is what the inspector shows, and it is
+    -- what makes a bulk "select all" reviewable instead of a black box.
+    CREATE TABLE media_category (
+      media_id          INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+      stat_hash         INTEGER NOT NULL,
+      version           INTEGER NOT NULL,
+      revision          TEXT    NOT NULL,
+      category          INTEGER NOT NULL,
+      confidence        REAL    NOT NULL,
+      score             REAL    NOT NULL DEFAULT 0,
+      reasons_json      TEXT,
+      sampled_side      INTEGER,
+      has_alpha         INTEGER,
+      transparent_ratio REAL,
+      color_count       INTEGER,
+      flat_ratio        REAL,
+      edge_ratio        REAL,
+      classified_ns     INTEGER NOT NULL
+    ) WITHOUT ROWID;
+
+    -- One user verdict per photo: confirm a category, or exclude the auto verdict. Survives reclassification.
+    CREATE TABLE category_feedback (
+      media_id   INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+      category   INTEGER NOT NULL,
+      verdict    INTEGER NOT NULL,
+      created_ns INTEGER NOT NULL
+    ) WITHOUT ROWID;
+    CREATE INDEX category_feedback_category ON category_feedback(category, verdict);
+
+    -- Staged moves only: a cycle or a case-only rename gets a temporary name recorded here before the move,
+    -- so a crash can be undone at launch. Deleted on success; never a history.
+    CREATE TABLE rename_journal (
+      id         INTEGER PRIMARY KEY,
+      media_id   INTEGER,
+      src_id     INTEGER NOT NULL,
+      parent_rel TEXT    NOT NULL,
+      from_name  TEXT    NOT NULL,
+      temp_name  TEXT    NOT NULL,
+      to_name    TEXT    NOT NULL,
+      created_ns INTEGER NOT NULL
+    );
+    CREATE INDEX rename_journal_parent ON rename_journal(src_id, parent_rel);
 
     CREATE TABLE thumbnail_cache (
       media_id     INTEGER NOT NULL,

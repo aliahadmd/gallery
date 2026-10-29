@@ -2,6 +2,34 @@ import Foundation
 import GalleryDomain
 import GallerySQLite
 
+/// One page of ids in ascending order.
+public struct IDPage: Sendable, Hashable {
+    public var ids: [MediaID]
+    public var hasMore: Bool
+
+    public init(ids: [MediaID], hasMore: Bool) {
+        self.ids = ids
+        self.hasMore = hasMore
+    }
+}
+
+/// The aggregate the selection bar and the aggregate inspector show for a whole-album selection.
+public struct SelectionSummary: Sendable, Hashable {
+    public var total: Int
+    public var images: Int
+    public var videos: Int
+    public var byteSize: Int64
+    public var favorites: Int
+
+    public init(total: Int, images: Int, videos: Int, byteSize: Int64, favorites: Int) {
+        self.total = total
+        self.images = images
+        self.videos = videos
+        self.byteSize = byteSize
+        self.favorites = favorites
+    }
+}
+
 /// The read side. A second connection, opened `SQLITE_OPEN_READONLY`, is what lets the grid keep scrolling
 /// while a 100k-file scan is mid-batch — WAL gives the reader a snapshot instead of a queue behind the
 /// writer, and `query_only=ON` means a bug in this file cannot corrupt the catalog.
@@ -104,6 +132,241 @@ public actor CatalogReader {
             compiled.arguments
         )
         return Int(value?.int64OrZero ?? 0)
+    }
+
+    // MARK: - Whole-album selection
+
+    /// One page of ids in ascending id order. A whole-album selection is resolved with this: the cursor is
+    /// the last id seen, and `upperBound` (frozen when the user confirmed an action) keeps rows scanned later
+    /// out of it.
+    public func ids(
+        album: AlbumKind, after cursor: MediaID? = nil, upperBound: MediaID? = nil, limit: Int = 500
+    ) throws -> IDPage {
+        let compiled = AlbumQuery.compile(album)
+        var sql = "SELECT media.id FROM media LEFT JOIN favorite ON favorite.media_id = media.id WHERE \(compiled.whereSQL)"
+        var arguments = compiled.arguments
+        if let cursor {
+            sql += " AND media.id > ?"
+            arguments.append(.integer(cursor.rawValue))
+        }
+        if let upperBound {
+            sql += " AND media.id <= ?"
+            arguments.append(.integer(upperBound.rawValue))
+        }
+        sql += " ORDER BY media.id LIMIT ?"
+        arguments.append(.integer(Int64(limit + 1)))
+
+        let rows = try handle.query(sql, arguments)
+        let hasMore = rows.count > limit
+        let kept = hasMore ? Array(rows.dropLast()) : rows
+        return IDPage(ids: try kept.map { MediaID(rawValue: try $0.int64(named: "id")) },
+                      hasMore: hasMore)
+    }
+
+    /// The same page as `ids`, as full rows — what a batch action consumes.
+    public func items(
+        album: AlbumKind, after cursor: MediaID? = nil, upperBound: MediaID? = nil, limit: Int = 200
+    ) throws -> [MediaItem] {
+        let compiled = AlbumQuery.compile(album)
+        var sql = "SELECT \(CatalogRow.itemSelectList) \(CatalogRow.itemFrom) WHERE \(compiled.whereSQL)"
+        var arguments = compiled.arguments
+        if let cursor {
+            sql += " AND media.id > ?"
+            arguments.append(.integer(cursor.rawValue))
+        }
+        if let upperBound {
+            sql += " AND media.id <= ?"
+            arguments.append(.integer(upperBound.rawValue))
+        }
+        sql += " ORDER BY media.id LIMIT ?"
+        arguments.append(.integer(Int64(limit)))
+        return try handle.query(sql, arguments).map(CatalogRow.item)
+    }
+
+    /// Which of these ids still belong to the album. Pruning an explicit selection against the album, rather
+    /// than against the loaded page, is what keeps a reload from silently dropping off-page selections.
+    public func ids(in album: AlbumKind, among ids: [MediaID]) throws -> Set<MediaID> {
+        guard !ids.isEmpty else { return [] }
+        let compiled = AlbumQuery.compile(album)
+        var alive: Set<MediaID> = []
+        var index = 0
+        while index < ids.count {
+            let chunk = Array(ids[index..<min(index + 500, ids.count)])
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
+            let rows = try handle.query(
+                "SELECT media.id FROM media LEFT JOIN favorite ON favorite.media_id = media.id WHERE \(compiled.whereSQL) AND media.id IN (\(placeholders))",
+                compiled.arguments + chunk.map { .integer($0.rawValue) }
+            )
+            for row in rows {
+                alive.insert(MediaID(rawValue: try row.int64(named: "id")))
+            }
+            index += chunk.count
+        }
+        return alive
+    }
+
+    /// Frozen at confirmation so the action cannot grow while the user reads the dialog.
+    public func maxMediaID() throws -> MediaID? {
+        guard let value = try handle.firstValue("SELECT MAX(media.id) FROM media"),
+              case .integer(let id) = value, id > 0 else {
+            return nil
+        }
+        return MediaID(rawValue: id)
+    }
+
+    /// Category shelf counts, with feedback applied exactly as the album query applies it.
+    public func categoryCounts(minimumItems: Int = 1) throws -> [CategoryCount] {
+        try handle.query(
+            """
+            SELECT CASE WHEN cf.verdict > 0 THEN cf.category ELSE media.category END AS category,
+                   COUNT(*) AS count
+            FROM media LEFT JOIN category_feedback AS cf ON cf.media_id = media.id
+            WHERE media.trash = 0
+              AND (cf.verdict > 0
+                   OR (media.category <> 0 AND COALESCE(cf.verdict, 1) > 0))
+            GROUP BY 1 HAVING COUNT(*) >= ?
+            ORDER BY count DESC
+            """,
+            [.integer(Int64(minimumItems))]
+        ).compactMap { row in
+            guard let category = MediaCategory(rawValue: Int16(truncatingIfNeeded:
+                try row.int64(named: "category"))) else { return nil }
+            return CategoryCount(category: category, count: Int(try row.int64(named: "count")))
+        }
+    }
+
+    /// The stored evidence for a row, for the inspector's reason chips.
+    public func categoryEvidence(ids: [MediaID]) throws -> [MediaID: CategoryEvidence] {
+        guard !ids.isEmpty else { return [:] }
+        let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
+        let rows = try handle.query(
+            """
+            SELECT media_id, version, revision, category, confidence, score, reasons_json, sampled_side,
+                   has_alpha, transparent_ratio, color_count, flat_ratio, edge_ratio
+            FROM media_category WHERE media_id IN (\(placeholders))
+            """,
+            ids.map { .integer($0.rawValue) }
+        )
+        var result: [MediaID: CategoryEvidence] = [:]
+        for row in rows {
+            let reasonsJSON = try row.optionalString(named: "reasons_json")
+            let reasons = reasonsJSON.flatMap { text in
+                try? JSONDecoder().decode([CategoryReason].self, from: Data(text.utf8))
+            } ?? []
+            let category = MediaCategory(rawValue: Int16(truncatingIfNeeded:
+                try row.int64(named: "category"))) ?? .none
+            result[MediaID(rawValue: try row.int64(named: "media_id"))] = CategoryEvidence(
+                category: category,
+                confidence: try row.double(named: "confidence"),
+                score: try row.double(named: "score"),
+                reasons: reasons,
+                version: Int(try row.int64(named: "version")),
+                revision: try row.string(named: "revision")
+            )
+        }
+        return result
+    }
+
+    /// The perceptual hash the analysis pass stored for a still.
+    public func dhash(for mediaID: MediaID) throws -> UInt64? {
+        let value = try handle.firstValue(
+            "SELECT dhash FROM media_analysis WHERE media_id = ?", [.integer(mediaID.rawValue)]
+        )
+        guard case .integer(let raw)? = value else { return nil }
+        return UInt64(bitPattern: raw)
+    }
+
+    /// Visually similar stills by Hamming distance on the stored 64-bit hash, nearest first. A full scan of
+    /// the hashes is a few megabytes and a trivial XOR loop; the alternative — an index on a bit pattern no
+    /// SQLite operator understands — is a table nobody keeps in sync.
+    public func similarIDs(
+        to dhash: UInt64, maxDistance: Int = 6, limit: Int = 1_000, scanLimit: Int = 50_000
+    ) throws -> [(id: MediaID, distance: Int)] {
+        let rows = try handle.query(
+            """
+            SELECT media_analysis.media_id AS id, media_analysis.dhash AS dhash
+            FROM media_analysis JOIN media ON media.id = media_analysis.media_id
+            WHERE media.trash = 0 AND media.analysis_stage = 2 AND media_analysis.dhash IS NOT NULL
+            ORDER BY media_analysis.analyzed_ns DESC LIMIT ?
+            """,
+            [.integer(Int64(scanLimit))]
+        )
+        var matches: [(MediaID, Int)] = []
+        for row in rows {
+            guard let raw = try row.optionalInt64(named: "dhash") else { continue }
+            let distance = (dhash ^ UInt64(bitPattern: raw)).nonzeroBitCount
+            if distance <= maxDistance {
+                matches.append((MediaID(rawValue: try row.int64(named: "id")), distance))
+            }
+        }
+        return matches.sorted { $0.1 < $1.1 }.prefix(limit).map { $0 }
+    }
+
+    /// The Live Photo partner of each still, when both halves are in the library. Pass A pairs by directory,
+    /// stem and a two-second window; this re-derives the same rule for the rename planner, which must move
+    /// both halves together or lose the pair.
+    public func liveCompanions(of ids: [MediaID]) throws -> [MediaID: MediaID] {
+        guard !ids.isEmpty else { return [:] }
+        var result: [MediaID: MediaID] = [:]
+        var index = 0
+        while index < ids.count {
+            let chunk = Array(ids[index..<min(index + 500, ids.count)])
+            let rows = try items(ids: chunk)
+            var folders: [String: [MediaItem]] = [:]
+            for row in rows where row.subtype.contains(.livePhoto) {
+                folders["\(row.sourceID.rawValue)|\(row.parentDirectory)", default: []].append(row)
+            }
+            for (_, stills) in folders {
+                guard let first = stills.first else { continue }
+                let siblings = try handle.query(
+                    """
+                    SELECT \(CatalogRow.itemSelectList) \(CatalogRow.itemFrom)
+                    WHERE media.src_id = ? AND media.parent_rel = ? AND (media.subtype & ?) <> 0
+                    """,
+                    [.integer(first.sourceID.rawValue), .text(first.parentDirectory),
+                     .integer(Int64(MediaSubtype.livePhotoCompanion.rawValue))]
+                ).map(CatalogRow.item)
+                for still in stills {
+                    let stem = Self.foldedStem(still.name)
+                    if let companion = siblings.first(where: { Self.foldedStem($0.name) == stem }) {
+                        result[still.id] = companion.id
+                    }
+                }
+            }
+            index += chunk.count
+        }
+        return result
+    }
+
+    private static func foldedStem(_ name: String) -> String {
+        (name as NSString).deletingPathExtension
+            .precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// What the selection bar and the aggregate inspector say about a whole-album selection.
+    public func selectionSummary(album: AlbumKind) throws -> SelectionSummary {
+        let compiled = AlbumQuery.compile(album)
+        let rows = try handle.query(
+            """
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(CASE WHEN media.kind = 0 THEN 1 ELSE 0 END), 0) AS images,
+                   COALESCE(SUM(CASE WHEN media.kind = 1 THEN 1 ELSE 0 END), 0) AS videos,
+                   COALESCE(SUM(media.size_bytes), 0) AS bytes,
+                   COALESCE(SUM(CASE WHEN favorite.media_id IS NULL THEN 0 ELSE 1 END), 0) AS favorites
+            FROM media LEFT JOIN favorite ON favorite.media_id = media.id
+            WHERE \(compiled.whereSQL)
+            """,
+            compiled.arguments
+        )
+        let row = rows.first
+        return SelectionSummary(
+            total: Int(try row?.int64(named: "total") ?? 0),
+            images: Int(try row?.int64(named: "images") ?? 0),
+            videos: Int(try row?.int64(named: "videos") ?? 0),
+            byteSize: try row?.int64(named: "bytes") ?? 0,
+            favorites: Int(try row?.int64(named: "favorites") ?? 0)
+        )
     }
 
     /// One row per album, ordered the way the sidebar shows them. `COUNT(*)` here is the same predicate the
@@ -295,6 +558,7 @@ public actor CatalogReader {
             FROM media_fts
             JOIN media ON media.id = media_fts.rowid
             LEFT JOIN favorite ON favorite.media_id = media.id
+            LEFT JOIN category_feedback AS cf ON cf.media_id = media.id
             WHERE media_fts MATCH ? AND \(scope.whereSQL)
             ORDER BY rank LIMIT ?
             """,

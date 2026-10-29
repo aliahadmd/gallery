@@ -13,6 +13,7 @@ public struct InspectorView: View {
 
     @State private var preview: CGImage?
     @State private var backupDate: Date?
+    @State private var categoryEvidence: CategoryEvidence?
 
     public init(model: MediaLibraryModel) {
         self.model = model
@@ -35,6 +36,7 @@ public struct InspectorView: View {
                 return
             }
             backupDate = await model.previousVersion(for: id)
+            categoryEvidence = await model.categoryEvidence(for: id)
         }
     }
 
@@ -64,6 +66,42 @@ public struct InspectorView: View {
                 }
                 .buttonStyle(.plain)
                 .help(item.isFavorite ? "Remove from Favorites" : "Add to Favorites")
+            }
+
+            if let evidence = categoryEvidence, item.category != .none {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Category").font(.caption).foregroundStyle(.secondary)
+                    Label(item.category.title, systemImage: item.category.symbol)
+                        .font(.callout)
+                    Text("\(Int((item.categoryConfidence * 100).rounded()))% confidence")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    ForEach(evidence.reasons.prefix(4), id: \.code) { reason in
+                        Text("• " + reason.code.text)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    HStack(spacing: 8) {
+                        if item.category != .photo {
+                            Button("Not \(item.category.title)") {
+                                Task { await model.setCategoryFeedback(.exclude, for: item) }
+                            }
+                            .controlSize(.small)
+                        }
+                        Menu("This is…") {
+                            ForEach(MediaCategory.cleanupShelf, id: \.self) { category in
+                                Button(category.title) {
+                                    Task { await model.setCategoryFeedback(.confirm(category), for: item) }
+                                }
+                            }
+                            Divider()
+                            Button("Automatic") {
+                                Task { await model.setCategoryFeedback(.automatic, for: item) }
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                }
             }
 
             if let captured = item.capture?.instant {

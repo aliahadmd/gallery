@@ -7,8 +7,9 @@ import GallerySQLite
 /// already current, so the first `ALTER` collides. These helpers put the schema back the way that release
 /// actually left it, so the ladder runs for real.
 extension SQLiteHandle {
-    /// Everything v2, v3 and v4 added is removed; `scan_queue` has no `rank` and FTS knows five columns.
+    /// Everything v2, v3, v4 and v5 added is removed; `scan_queue` has no `rank` and FTS knows five columns.
     func downgradeToV1() throws {
+        try downgradeToV4()
         try exec("""
         DROP TRIGGER media_fts_ai;
         DROP TRIGGER media_fts_ad;
@@ -64,6 +65,7 @@ extension SQLiteHandle {
     /// A v3 database: the analysis tables and the seven-column index are there; v4's title and ledger
     /// columns are not.
     func downgradeToV3() throws {
+        try downgradeToV4()
         try exec("""
         DROP TRIGGER media_fts_ai;
         DROP TRIGGER media_fts_ad;
@@ -100,6 +102,22 @@ extension SQLiteHandle {
         ALTER TABLE media DROP COLUMN title;
         ALTER TABLE trash_ledger DROP COLUMN result_stat_hash;
         ALTER TABLE trash_ledger DROP COLUMN completed_ns;
+        """)
+    }
+
+    /// A v4 database: v5's category columns, tables and rename journal are gone; FTS is the eight-column
+    /// index v4 shipped.
+    func downgradeToV4() throws {
+        try exec("""
+        DROP INDEX media_category_pending;
+        DROP INDEX media_category_lookup;
+        DROP TABLE rename_journal;
+        DROP TABLE category_feedback;
+        DROP TABLE media_category;
+        ALTER TABLE media DROP COLUMN category_attempts;
+        ALTER TABLE media DROP COLUMN category_stage;
+        ALTER TABLE media DROP COLUMN category_confidence;
+        ALTER TABLE media DROP COLUMN category;
         """)
     }
 

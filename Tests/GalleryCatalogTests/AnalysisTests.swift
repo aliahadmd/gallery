@@ -94,6 +94,56 @@ struct AnalysisTests {
         #expect(hits.first?.snippet.contains("Kyoto") == true)
     }
 
+    @Test("A v4 library walks forward to v5 with the category tables and the rename journal")
+    func v4WalksForwardToV5() async throws {
+        let fixture = try await CatalogFixture()
+        defer { fixture.tearDown() }
+        let source = try await fixture.addSource()
+        try await fixture.record([makeItem("IMG_0001.JPG", documentID: 1, sourceID: source.id)])
+
+        let downgraded = try SQLiteHandle.open(path: fixture.databaseURL.path, kind: .readWrite)
+        try downgraded.write {
+            try downgraded.downgradeToV4()
+            try downgraded.setUserVersion(4)
+        }
+        _ = try await fixture.reopened()
+
+        let referenceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gallery-schema-reference-\(UUID().uuidString).db")
+        defer { try? FileManager.default.removeItem(at: referenceURL) }
+        _ = try Catalog.open(at: referenceURL)
+        #expect(try columns(of: fixture.databaseURL, table: "media")
+                == columns(of: referenceURL, table: "media"))
+        #expect(try columns(of: fixture.databaseURL, table: "media_fts").count == 8,
+                "v5 adds no FTS column")
+        #expect(try columns(of: fixture.databaseURL, table: "media_category").contains("reasons_json"))
+        #expect(try columns(of: fixture.databaseURL, table: "category_feedback").contains("verdict"))
+        #expect(try columns(of: fixture.databaseURL, table: "rename_journal").contains("temp_name"))
+        #expect(try await fixture.reader.search("IMG").count == 1, "search still works after v5")
+    }
+
+    @Test("Similar photos are ranked by Hamming distance on the stored hash")
+    func similarByHash() async throws {
+        let fixture = try await CatalogFixture()
+        defer { fixture.tearDown() }
+        let source = try await fixture.addSource()
+        let ids = try await fixture.record((1...3).map {
+            makeItem("IMG_\($0).JPG", documentID: Int64($0), sourceID: source.id)
+        })
+        try await fixture.catalog.recordAnalysis([
+            analysis(ids[0], dhash: 0xFFFF_FFFF_FFFF_FFFF),
+            analysis(ids[1], dhash: 0xFFFF_FFFF_FFFF_FFFE),
+            analysis(ids[2], dhash: 0x0000_0000_0000_0000),
+        ])
+
+        let matches = try await fixture.reader.similarIDs(
+            to: 0xFFFF_FFFF_FFFF_FFFF, maxDistance: 4
+        )
+        #expect(matches.map(\.id) == [ids[0], ids[1]], "nearest first; the unrelated one is excluded")
+        #expect(matches.map(\.distance) == [0, 1])
+        #expect(try await fixture.reader.dhash(for: ids[1]) == 0xFFFF_FFFF_FFFF_FFFE)
+    }
+
     @Test("A stale pass-B write lands on zero rows instead of undoing an edit")
     func metadataWriteIsCompareAndSet() async throws {
         let fixture = try await CatalogFixture()

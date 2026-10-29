@@ -40,7 +40,16 @@ final class AppContainer {
             // worker so the analysis actor only knows "is someone else using the machine".
             let analysis = AnalysisWorker(catalog: catalog, resolver: resolver,
                                           configuration: .init(gate: { await worker.isRunning }))
+            // The category pass reads Vision's stored output; it waits for the drain, not for the analyser
+            // (analysis_stage gates its claims).
+            let categorizer = CategoryWorker(
+                catalog: catalog, resolver: resolver,
+                configuration: .init(gate: { await worker.isRunning })
+            )
 
+            let rename = RenameService(
+                catalog: catalog, reader: reader, resolver: resolver, selfWrites: selfWrites
+            )
             let library = MediaLibraryModel(reader: reader, coordinator: coordinator, passB: worker,
                                             thumbnails: thumbnails, catalog: catalog, resolver: resolver,
                                             trashRoot: url.deletingLastPathComponent()
@@ -51,11 +60,22 @@ final class AppContainer {
                                                 trashRoot: url.deletingLastPathComponent()
                                                     .appendingPathComponent("GalleryTrash", isDirectory: true),
                                                 selfWrites: selfWrites
-                                            ))
+                                            ),
+                                            selfWrites: selfWrites,
+                                            rename: rename,
+                                            categorizer: categorizer)
             library.actions = MediaLibraryActions(
                 exportCopies: { [weak library] ids in
                     guard let library else { return }
                     await ExportPicker.presentBatchExport(ids, into: library)
+                },
+                exportSelection: { [weak library] in
+                    guard let library else { return }
+                    await ExportPicker.presentBatchExport(into: library)
+                },
+                moveSelection: { [weak library] in
+                    guard let library else { return }
+                    await MovePicker.present(into: library)
                 }
             )
             model = library

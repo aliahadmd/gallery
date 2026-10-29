@@ -58,6 +58,7 @@ public enum AlbumKind: Sendable, Hashable, Codable {
     case place(PlaceKey)
     case smart(SmartRule)
     case tag(TagKey)
+    case category(MediaCategory)
     case person(PersonKey)
     case duplicates
     case duplicateGroup(DuplicateKey)

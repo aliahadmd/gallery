@@ -197,6 +197,10 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
     public var aesthetic: Double
     /// A screenshot, receipt or whiteboard: worth OCR, never worth being an album's cover.
     public var isUtility: Bool
+    /// The cleanup classifier's verdict and confidence, with the user's feedback already applied by the
+    /// row projection. `none` means "not classified yet".
+    public var category: MediaCategory
+    public var categoryConfidence: Double
 
     public init(
         id: MediaID,
@@ -233,7 +237,9 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
         addedAt: Date = Date(),
         indexedAt: Date? = nil,
         aesthetic: Double = 0,
-        isUtility: Bool = false
+        isUtility: Bool = false,
+        category: MediaCategory = .none,
+        categoryConfidence: Double = 0
     ) {
         self.id = id
         self.identity = identity
@@ -270,6 +276,8 @@ public struct MediaItem: Identifiable, Sendable, Hashable, Codable {
         self.indexedAt = indexedAt
         self.aesthetic = aesthetic
         self.isUtility = isUtility
+        self.category = category
+        self.categoryConfidence = categoryConfidence
     }
 
     /// Cell aspect ratio, corrected for EXIF orientation so a portrait JPEG does not lay out landscape.

@@ -51,11 +51,51 @@ public struct RootView: View {
         .task { await model.start() }
         .onDisappear { model.stop() }
         .alert("Gallery", isPresented: hasNotice) {
+            if let notice = model.notices.first {
+                ForEach(notice.commands, id: \.self) { command in
+                    Button(command.title) { model.perform(command) }
+                }
+            }
             Button("OK") { model.dismissNotice() }
         } message: {
             if let notice = model.notices.first {
                 Text(notice.text)
                 if let detail = notice.detail { Text(detail) }
+            }
+        }
+        .confirmationDialog(
+            model.pendingDestructive?.title ?? "Confirm",
+            isPresented: Binding(
+                get: { model.pendingDestructive != nil },
+                set: { if !$0 { model.cancelDestructive() } }
+            ),
+            presenting: model.pendingDestructive
+        ) { action in
+            Button(action.confirmTitle, role: .destructive) { model.confirmDestructive() }
+            Button("Cancel", role: .cancel) { model.cancelDestructive() }
+        } message: { action in
+            Text(action.message)
+        }
+        .sheet(isPresented: Binding(
+            get: { model.isShowingBatchFailures },
+            set: { if !$0 { model.dismissBatchFailures() } }
+        )) {
+            BatchFailureSheet(failures: model.lastBatchFailures) { model.dismissBatchFailures() }
+        }
+        .sheet(isPresented: Binding(
+            get: { model.renameSession != nil },
+            set: { if !$0 { model.closeRename() } }
+        )) {
+            if let session = model.renameSession {
+                RenameSheet(model: model, session: session)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { model.batchMetadataSession != nil },
+            set: { if !$0 { model.closeBatchMetadata() } }
+        )) {
+            if let session = model.batchMetadataSession {
+                BatchMetadataSheet(model: model, session: session)
             }
         }
     }

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import GalleryDomain
 
 /// The middle column: paged rows of the selected album, plus the scan's own progress over it.
@@ -12,9 +13,35 @@ public struct LibraryGridView: View {
     }
 
     private static let columns = [GridItem(.adaptive(minimum: 160, maximum: 260), spacing: 3)]
+    private static let gridSpace = "libraryGrid"
+
+    @State private var cellFrames = MarqueeFrames()
+    @State private var marqueeStart: CGPoint?
+    @State private var marqueeCurrent: CGPoint?
 
     public var body: some View {
-        ScrollView {
+        VStack(spacing: 0) {
+            if model.selectedCount > 0 {
+                SelectionBar(model: model)
+            }
+            if case .category(let category) = model.selection {
+                HStack(spacing: 8) {
+                    Label(category.title, systemImage: category.symbol)
+                        .font(.callout.weight(.medium))
+                    Text("\(model.rowCount.formatted()) items")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                    Spacer()
+                    Button("Select All \(model.rowCount.formatted())") { model.selectAll() }
+                        .controlSize(.small)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(.quaternary.opacity(0.35))
+                .overlay(alignment: .bottom) { Divider() }
+            }
+            ScrollView {
             if model.items.isEmpty {
                 emptyState
             } else if model.sort.field == .captureDate {
@@ -41,31 +68,36 @@ public struct LibraryGridView: View {
                 .padding(3)
             }
         }
+        .coordinateSpace(name: Self.gridSpace)
+        .background(marqueeBackground)
+        .overlay(alignment: .topLeading) { marqueeOverlay }
+        .onPreferenceChange(CellFramePreferenceKey.self) { cellFrames.frames = $0 }
+        }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
         .searchable(text: searchBinding, placement: .toolbar,
                     prompt: Text("Search \(model.selection.uiTitle(sources: model.sources))"))
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if !model.selectedIDs.isEmpty, let selected = model.selectedItem {
-                    let count = model.selectedIDs.count
+                if model.selectedCount > 0, let selected = model.selectedItem {
+                    let count = model.selectedCount
                     if model.isRecentlyDeleted {
                         Button {
-                            Task { await model.restore(model.selectedMediaIDs) }
+                            Task { await model.restoreSelection() }
                         } label: {
                             Label("Restore", systemImage: "arrow.uturn.backward")
                         }
                         .help(count > 1 ? "Put \(count) items back (⌘⌫)" : "Put the photo back where it was (⌘⌫)")
 
                         Button {
-                            Task { await model.deleteForever(model.selectedMediaIDs) }
+                            model.requestDeleteForever()
                         } label: {
                             Label("Delete Forever", systemImage: "trash.slash")
                         }
                         .help("Remove the file for good")
                     } else {
                         Button {
-                            Task { await model.moveToTrash(model.selectedMediaIDs) }
+                            model.requestTrash()
                         } label: {
                             Label("Delete", systemImage: "trash")
                         }
@@ -108,9 +140,9 @@ public struct LibraryGridView: View {
                             }
                         }
 
-                        if model.actions != nil, model.selectedItems.contains(where: { $0.kind == .image }) {
+                        if model.actions != nil {
                             Button {
-                                Task { await model.actions?.exportCopies(model.selectedMediaIDs) }
+                                Task { await model.actions?.exportSelection() }
                             } label: {
                                 Label("Export", systemImage: "square.and.arrow.up")
                             }
@@ -163,7 +195,10 @@ public struct LibraryGridView: View {
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 400)
         }
         .overlay(alignment: .bottomTrailing) {
-            if let progress = model.exportProgress {
+            if let session = model.batchSession {
+                BatchProgressHUD(session: session) { model.cancelBatch() }
+                    .padding(12)
+            } else if let progress = model.exportProgress {
                 ExportProgressHUD(progress: progress) {
                     Task { await model.cancelExport() }
                 }
@@ -178,6 +213,44 @@ public struct LibraryGridView: View {
                 )
                 .padding(12)
             }
+        }
+    }
+
+    /// A drag that starts on empty grid space is a rubber band; a drag that starts on a tile is the tile's
+    /// own file drag-out and never reaches here.
+    private var marqueeBackground: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 4, coordinateSpace: .named(Self.gridSpace))
+                    .onChanged { value in
+                        if marqueeStart == nil { marqueeStart = value.startLocation }
+                        marqueeCurrent = value.location
+                        guard let start = marqueeStart, let current = marqueeCurrent else { return }
+                        let rect = Marquee.rect(from: start, to: current)
+                        let modifiers = NSEvent.modifierFlags
+                        model.marqueeSelect(
+                            Marquee.ids(intersecting: rect, frames: cellFrames.frames),
+                            command: modifiers.contains(.command),
+                            shift: modifiers.contains(.shift)
+                        )
+                    }
+                    .onEnded { _ in
+                        marqueeStart = nil
+                        marqueeCurrent = nil
+                    }
+            )
+    }
+
+    @ViewBuilder private var marqueeOverlay: some View {
+        if let start = marqueeStart, let current = marqueeCurrent {
+            let rect = Marquee.rect(from: start, to: current)
+            Rectangle()
+                .fill(Color.accentColor.opacity(0.12))
+                .overlay(Rectangle().strokeBorder(Color.accentColor, lineWidth: 1))
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+                .allowsHitTesting(false)
         }
     }
 
