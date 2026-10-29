@@ -5,10 +5,11 @@ import GalleryUI
 /// library to show — and the first thing a user with an empty window wants to do is add a folder.
 struct GalleryCommands: Commands {
     let model: MediaLibraryModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
-        // Replacing `.newItem` instead of appending to it: a second window would start a second `.task`
-        // against the same coordinator, so two feeds, two scans per folder and two cursors over one grid.
+        // Replacing `.newItem` instead of appending to it: a second library window would start a second
+        // `.task` against the same coordinator, so two feeds, two scans per folder and two cursors.
         CommandGroup(replacing: .newItem) {
             Button("Add Folder…") {
                 Task { await FolderPicker.present(into: model) }
@@ -21,6 +22,18 @@ struct GalleryCommands: Commands {
             .keyboardShortcut("r", modifiers: .command)
         }
 
+        // The three panels, in the order they appear on screen.
+        CommandGroup(after: .sidebar) {
+            Button("Show All Panels") { model.panels = .all }
+                .keyboardShortcut("1", modifiers: .command)
+            Button("Hide Sidebar") { model.panels = .detailOnly }
+                .keyboardShortcut("2", modifiers: .command)
+            Button(model.isInspectorPresented ? "Hide Info" : "Show Info") {
+                model.isInspectorPresented.toggle()
+            }
+            .keyboardShortcut("3", modifiers: .command)
+        }
+
         CommandMenu("Photo") {
             Button("Open") {
                 if let id = model.selectedID { model.openViewer(id) }
@@ -28,36 +41,47 @@ struct GalleryCommands: Commands {
             .keyboardShortcut(.return, modifiers: [])
             .disabled(model.selectedID == nil || model.viewerItem != nil)
 
-            Button("Toggle Favorite") {
-                if let id = model.selectedID {
-                    Task { await model.toggleFavorite(id) }
-                }
+            Button("Open in New Window") {
+                guard let id = model.selectedID else { return }
+                model.openViewer(id)
+                openWindow(id: "viewer")
             }
-            .keyboardShortcut("f", modifiers: [.command, .shift])
-            .disabled(model.selectedID == nil)
-
-            // ⌘⌫, not ⌘⇧⌫: the shifted form is macOS's own "empty trash" gesture on other apps and is
-            // reserved. In Recently Deleted the same key is the undo, because that is where the user is.
-            Button(model.isRecentlyDeleted ? "Restore" : "Move to Trash") {
-                if let id = model.selectedID {
-                    Task {
-                        if model.isRecentlyDeleted {
-                            await model.restore([id])
-                        } else {
-                            await model.moveToTrash([id])
-                        }
-                    }
-                }
-            }
-            .keyboardShortcut(.delete, modifiers: .command)
+            .keyboardShortcut(.return, modifiers: .command)
             .disabled(model.selectedID == nil)
 
             Divider()
 
-            Button("Show Info") {
-                model.isInspectorPresented.toggle()
+            Button(favoriteTitle) {
+                Task { await model.toggleFavoriteSelection() }
             }
-            .keyboardShortcut("i", modifiers: [.command, .option])
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .disabled(model.selectedIDs.isEmpty)
+
+            // ⌘⌫, not ⌘⇧⌫: the shifted form is macOS's own "empty trash" gesture elsewhere and is reserved.
+            // In Recently Deleted the same key is the undo, because that is where the user is.
+            Button(model.isRecentlyDeleted ? "Restore" : "Move to Trash") {
+                let ids = model.selectedMediaIDs
+                Task {
+                    if model.isRecentlyDeleted {
+                        await model.restore(ids)
+                    } else {
+                        await model.moveToTrash(ids)
+                    }
+                }
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(model.selectedIDs.isEmpty)
+
+            Button("Select All") { model.selectAll() }
+                .keyboardShortcut("a", modifiers: .command)
         }
+    }
+
+    /// The star's menu title follows what the selection would do, which is the difference between undoing a
+    /// favourite and adding a hundred.
+    private var favoriteTitle: String {
+        let chosen = model.selectedItems
+        let allFavorite = !chosen.isEmpty && chosen.allSatisfy(\.isFavorite)
+        return allFavorite ? "Remove from Favorites" : "Add to Favorites"
     }
 }

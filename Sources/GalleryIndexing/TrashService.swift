@@ -154,6 +154,21 @@ public actor TrashService {
         return outcome
     }
 
+    /// The monthly sweep: entries the catalog says have been in the trash longer than the cutoff lose their
+    /// files. Silent by design — a file the user deleted last month does not need an announcement today.
+    public func purgeExpired(olderThan cutoff: Date) async -> Outcome {
+        var outcome = Outcome()
+        let due = (try? await catalog.purgeOlderThan(cutoff)) ?? []
+        for entry in due {
+            if let location = location(for: entry), FileManager.default.fileExists(atPath: location.path) {
+                try? FileManager.default.removeItem(at: location)
+            }
+            try? await catalog.recordPurge(ledgerID: entry.id, mediaID: entry.mediaID)
+            outcome.purged.append(entry.mediaID)
+        }
+        return outcome
+    }
+
     /// Trashing twice must not overwrite the first copy: the name is the user's, the suffix is ours.
     private func freeDestination(for item: MediaItem) -> URL {
         let base = root

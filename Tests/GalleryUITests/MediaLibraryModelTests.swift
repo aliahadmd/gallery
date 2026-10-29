@@ -688,4 +688,123 @@ final class Fixture {
         #expect(!FileManager.default.fileExists(atPath: trashed.path))
         #expect(try await fixture.reader.count(album: .recentlyDeleted) == 0)
     }
+
+    @Test("⇧-click takes the range, ⌘-click toggles one row, and the last click is the primary")
+    func multiSelection() async throws {
+        let fixture = try await Fixture(files: 8)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+        let items = fixture.model.items
+        #expect(items.count == 8)
+
+        fixture.model.select(items[1].id)
+        #expect(fixture.model.selectedIDs == [items[1].id])
+
+        fixture.model.select(items[4].id, range: true)
+        #expect(fixture.model.selectedIDs == Set(items[1...4].map(\.id)))
+        #expect(fixture.model.selectedItem?.id == items[4].id, "the click that extended is the primary")
+
+        fixture.model.select(items[6].id, extending: true)
+        #expect(fixture.model.selectedIDs == Set(items[1...4].map(\.id)).union([items[6].id]))
+
+        fixture.model.select(items[3].id, extending: true)
+        #expect(!fixture.model.selectedIDs.contains(items[3].id), "⌘-click on a selected row removes it")
+        #expect(fixture.model.selectedIDs.count == 4)
+
+        fixture.model.selectAll()
+        #expect(fixture.model.selectedIDs.count == 8)
+
+        // Switching albums drops a selection the user can no longer see.
+        await fixture.model.select(.allVideos)
+        #expect(fixture.model.selectedIDs.isEmpty)
+        #expect(fixture.model.selectedID == nil)
+    }
+
+    @Test("The grid's day headers follow the date sort and vanish under any other")
+    func daySections() async throws {
+        let fixture = try await Fixture(files: 0)
+        defer { await fixture.tearDown() }
+        let recent = Date(timeIntervalSince1970: 1_700_000_000)
+        let older = recent.addingTimeInterval(-3 * 86_400)
+        for index in 0..<2 {
+            try fixture.writeJPEG(named: "recent_\(index).jpg")
+            try FileManager.default.setAttributes(
+                [.modificationDate: recent.addingTimeInterval(Double(index))],
+                ofItemAtPath: fixture.media.appendingPathComponent("recent_\(index).jpg").path
+            )
+            try fixture.writeJPEG(named: "older_\(index).jpg")
+            try FileManager.default.setAttributes(
+                [.modificationDate: older.addingTimeInterval(Double(index))],
+                ofItemAtPath: fixture.media.appendingPathComponent("older_\(index).jpg").path
+            )
+        }
+
+        await fixture.model.start()
+        await fixture.model.add([fixture.media])
+        try await fixture.waitUntilIdle(fixture.coordinator)
+        try await fixture.waitUntil { fixture.model.items.first?.capture != nil &&
+                                       fixture.model.items.allSatisfy { $0.capture != nil } }
+
+        let sections = fixture.model.daySections
+        #expect(sections.count == 2)
+        #expect(sections[0].items.count == 2, "the newer day leads the default sort")
+        #expect(sections[0].items.allSatisfy { $0.name.hasPrefix("recent_") })
+        #expect(sections[0].title.contains("2023"))
+
+        fixture.model.sort = MediaSort(field: .fileName, order: .ascending)
+        #expect(fixture.model.daySections.isEmpty, "a date header under a name sort would be a lie")
+        fixture.model.stop()
+    }
+
+    @Test("A source's subfolders are listed as albums under it")
+    func subfolderAlbums() async throws {
+        let fixture = try await Fixture(files: 5)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        let source = try #require(fixture.model.sources.first)
+        let albums = try #require(fixture.model.subfolders[source.id])
+        #expect(albums.contains { $0.title == "IMG" }, "the nested folder the fixture wrote into")
+        let nested = try #require(albums.first { $0.title == "IMG" })
+        #expect(nested.itemCount == 1)
+    }
+
+    @Test("A search keeps the snippet that explains each hit")
+    func searchSnippets() async throws {
+        let fixture = try await Fixture(files: 0)
+        defer { await fixture.tearDown() }
+        for name in ["kyoto_1.jpg", "beach_1.jpg"] { try fixture.writeJPEG(named: name) }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        fixture.model.updateSearch("kyoto")
+        try await fixture.waitUntil { fixture.model.isSearching && fixture.model.items.count == 1 }
+
+        let item = try #require(fixture.model.items.first)
+        let snippet = try #require(fixture.model.searchSnippets[item.id])
+        #expect(snippet.lowercased().contains("kyoto"))
+
+        fixture.model.updateSearch("")
+        try await fixture.waitUntil { !fixture.model.isSearching }
+        #expect(fixture.model.searchSnippets.isEmpty)
+    }
+
+    @Test("A cell on screen can be dragged out as its file")
+    func dragURLIsResolvedForVisibleCells() async throws {
+        let fixture = try await Fixture(files: 2)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+        let item = try #require(fixture.model.items.first)
+
+        #expect(fixture.model.fileURL(for: item) == nil, "nothing is known until a cell reports")
+        fixture.model.cellAppeared(item)
+        try await fixture.waitUntil { fixture.model.fileURL(for: item) != nil }
+
+        let url = try #require(fixture.model.fileURL(for: item))
+        #expect(FileManager.default.fileExists(atPath: url.path))
+        #expect(url.lastPathComponent == item.name)
+    }
 }

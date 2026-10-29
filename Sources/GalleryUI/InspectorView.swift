@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreGraphics
+import MapKit
 import GalleryDomain
 
 /// What the selected photo is, without leaving the grid.
@@ -85,6 +86,26 @@ public struct InspectorView: View {
                 if let lens = item.lens, !lens.isEmpty {
                     row("Lens", lens)
                 }
+            }
+
+            if let gps = item.gps, gps.isValid {
+                Divider()
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 7) {
+                    row("Coordinates", String(format: "%.4f, %.4f", gps.latitude, gps.longitude))
+                }
+                // Where it was taken, at the size of the panel. Hit testing is off so the map cannot steal
+                // the scroll wheel from the inspector it sits in.
+                Map(initialPosition: .region(MKCoordinateRegion(
+                    center: CLLocationCoordinate2D(latitude: gps.latitude, longitude: gps.longitude),
+                    span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+                ))) {
+                    Marker(item.name, coordinate: CLLocationCoordinate2D(latitude: gps.latitude,
+                                                                         longitude: gps.longitude))
+                }
+                .mapStyle(.standard(pointsOfInterest: .excludingAll))
+                .frame(height: 140)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .allowsHitTesting(false)
             }
 
             Divider()

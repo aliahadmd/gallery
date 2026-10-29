@@ -17,19 +17,26 @@ public struct LibraryGridView: View {
         ScrollView {
             if model.items.isEmpty {
                 emptyState
+            } else if model.sort.field == .captureDate {
+                // Day headers under the date sort only: under "Name" a date header would describe an order
+                // the page is not in. The header pins, so a long day still says which day it is.
+                LazyVStack(alignment: .leading, spacing: 10, pinnedViews: [.sectionHeaders]) {
+                    ForEach(model.daySections) { section in
+                        Section {
+                            LazyVGrid(columns: Self.columns, spacing: 3) {
+                                ForEach(section.items) { item in cell(item) }
+                            }
+                        } header: {
+                            DayHeader(title: section.title, count: section.items.count)
+                        }
+                    }
+                    loadMoreTrigger
+                }
+                .padding(3)
             } else {
                 LazyVGrid(columns: Self.columns, spacing: 3) {
-                    ForEach(model.items) { item in
-                        MediaCellView(item: item, model: model, isSelected: model.selectedID == item.id)
-                    }
-                    // One clear pixel at the end of the grid is what turns "the user reached the bottom"
-                    // into a page request; a scroll-offset observer would fight the lazy stack.
-                    if model.hasMorePages {
-                        Color.clear
-                            .frame(height: 1)
-                            .gridCellColumns(Self.columns.count)
-                            .onAppear { Task { await model.loadMore() } }
-                    }
+                    ForEach(model.items) { item in cell(item) }
+                    loadMoreTrigger
                 }
                 .padding(3)
             }
@@ -40,43 +47,48 @@ public struct LibraryGridView: View {
                     prompt: Text("Search \(model.selection.uiTitle(sources: model.sources))"))
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if let selected = model.selectedItem {
+                if !model.selectedIDs.isEmpty, let selected = model.selectedItem {
+                    let count = model.selectedIDs.count
                     if model.isRecentlyDeleted {
                         Button {
-                            Task { await model.restore([selected.id]) }
+                            Task { await model.restore(model.selectedMediaIDs) }
                         } label: {
                             Label("Restore", systemImage: "arrow.uturn.backward")
                         }
-                        .help("Put the photo back where it was (⌘⌫)")
+                        .help(count > 1 ? "Put \(count) items back (⌘⌫)" : "Put the photo back where it was (⌘⌫)")
 
                         Button {
-                            Task { await model.deleteForever([selected.id]) }
+                            Task { await model.deleteForever(model.selectedMediaIDs) }
                         } label: {
                             Label("Delete Forever", systemImage: "trash.slash")
                         }
                         .help("Remove the file for good")
                     } else {
                         Button {
-                            Task { await model.moveToTrash([selected.id]) }
+                            Task { await model.moveToTrash(model.selectedMediaIDs) }
                         } label: {
                             Label("Delete", systemImage: "trash")
                         }
-                        .help("Move to Gallery's trash (⌘⌫)")
+                        .help(count > 1 ? "Move \(count) items to Gallery's trash (⌘⌫)"
+                                        : "Move to Gallery's trash (⌘⌫)")
 
                         Button {
-                            Task { await model.toggleFavorite(selected.id) }
+                            Task { await model.toggleFavoriteSelection() }
                         } label: {
-                            Label(selected.isFavorite ? "Unfavorite" : "Favorite",
-                                  systemImage: selected.isFavorite ? "star.fill" : "star")
+                            let allFavorite = model.selectedItems.allSatisfy(\.isFavorite)
+                            Label(allFavorite ? "Unfavorite" : "Favorite",
+                                  systemImage: allFavorite ? "star.fill" : "star")
                         }
                         .help("Favorite (⌘⇧F)")
 
-                        Button {
-                            model.openViewer(selected.id)
-                        } label: {
-                            Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
+                        if count == 1 {
+                            Button {
+                                model.openViewer(selected.id)
+                            } label: {
+                                Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
+                            }
+                            .help("Open the selected photo (Return)")
                         }
-                        .help("Open the selected photo (Return)")
                     }
                 }
 
@@ -125,6 +137,20 @@ public struct LibraryGridView: View {
                 )
                 .padding(12)
             }
+        }
+    }
+
+    @ViewBuilder private func cell(_ item: MediaItem) -> some View {
+        MediaCellView(item: item, model: model, isSelected: model.selectedIDs.contains(item.id))
+    }
+
+    /// One clear pixel at the end of the grid is what turns "the user reached the bottom" into a page
+    /// request; a scroll-offset observer would fight the lazy stack.
+    @ViewBuilder private var loadMoreTrigger: some View {
+        if model.hasMorePages {
+            Color.clear
+                .frame(height: 1)
+                .onAppear { Task { await model.loadMore() } }
         }
     }
 
@@ -215,5 +241,27 @@ extension SortField {
         case .pixelCount: "Resolution"
         case .duration: "Duration"
         }
+    }
+}
+
+/// A pinned day header. Opaque on purpose: a material would let the previous day's tiles show through the
+/// one line that is supposed to separate them.
+private struct DayHeader: View {
+    let title: String
+    let count: Int
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            Text(count.formatted())
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 6)
+        .background(.bar)
     }
 }

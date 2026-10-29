@@ -36,6 +36,12 @@ public struct SidebarView: View {
                 ForEach(model.sources) { source in
                     SourceRow(source: source, model: model)
                         .tag(AlbumKind.folder(source.id))
+                    // One level of folder albums, indented under the folder they belong to. Deeper nesting
+                    // is a file manager's job, not a gallery's.
+                    ForEach(model.subfolders[source.id] ?? []) { album in
+                        dateRow(album, symbol: "folder")
+                            .padding(.leading, 14)
+                    }
                 }
             }
             Section("Library") {
@@ -73,6 +79,14 @@ public struct SidebarView: View {
                         dateRow(album, symbol: "mappin.and.ellipse")
                     }
                 }
+            }
+
+            // Present but empty on purpose: People slots into the navigation without moving anything when
+            // face grouping arrives in a later version.
+            Section("People") {
+                Text("Faces arrive in a later version.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .listStyle(.sidebar)

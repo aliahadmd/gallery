@@ -87,6 +87,12 @@ public actor IndexCoordinator {
     private var watcherRoots: [SourceID: URL] = [:]
     private var watchDebounce: [SourceID: Task<Void, Never>] = [:]
 
+    /// A stream retains its watcher, so a watcher nobody stops outlives its owner. Closing the coordinator
+    /// (a test fixture, a relaunched app) has to tear the streams down explicitly.
+    deinit {
+        for watcher in watchers.values { watcher.stop() }
+    }
+
     private let catalog: Catalog
     private let reader: CatalogReader
     private let bookmarks: BookmarkStore

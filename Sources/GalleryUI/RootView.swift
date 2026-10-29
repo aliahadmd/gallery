@@ -43,13 +43,21 @@ public struct RootView: View {
         if model.sources.isEmpty {
             WelcomeView(addFolders: addFolders)
         } else {
-            NavigationSplitView {
+            // Driven by the model so ⌘1/⌘2 and the system's own sidebar toggle agree about the column.
+            NavigationSplitView(columnVisibility: columnVisibility) {
                 SidebarView(model: model)
                     .navigationSplitViewColumnWidth(min: 208, ideal: 248, max: 330)
             } detail: {
                 LibraryGridView(model: model, addFolders: addFolders)
             }
         }
+    }
+
+    private var columnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(
+            get: { model.panels == .all ? .all : .detailOnly },
+            set: { model.panels = $0 == .detailOnly ? .detailOnly : .all }
+        )
     }
 
     private var hasNotice: Binding<Bool> {

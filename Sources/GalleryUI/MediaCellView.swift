@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import GalleryDomain
 
 /// One tile: the picture if the cache has one, and always the shape, the name and the badges — which is the
@@ -53,7 +54,21 @@ public struct MediaCellView: View {
         }
         .contentShape(RoundedRectangle(cornerRadius: 4))
         .onTapGesture(count: 2) { model.openViewer(item.id) }
-        .onTapGesture { model.select(item.id) }
+        .onTapGesture {
+            // SwiftUI's tap gesture does not carry the modifiers, and the click that extends a selection is
+            // exactly the one with ⌘ or ⇧ held; read them at the moment the gesture fires.
+            let modifiers = NSEvent.modifierFlags
+            model.select(item.id, extending: modifiers.contains(.command),
+                         range: modifiers.contains(.shift))
+        }
+        // Dragging a tile into Finder (or another app) hands over the file itself. The URL is the one the
+        // model already resolved for the cells on screen; a tile that has never reported offers nothing.
+        .onDrag {
+            if let url = model.fileURL(for: item) {
+                return NSItemProvider(contentsOf: url) ?? NSItemProvider()
+            }
+            return NSItemProvider()
+        }
         .contextMenu {
             Button("Open") { model.openViewer(item.id) }
             Button(item.isFavorite ? "Remove from Favorites" : "Add to Favorites") {
@@ -99,9 +114,19 @@ public struct MediaCellView: View {
             if item.isFavorite {
                 Image(systemName: "star.fill").foregroundStyle(.yellow)
             }
-            Text(item.name)
+            if item.subtype.contains(.raw) {
+                Text("RAW")
+                    .font(.system(size: 8, weight: .bold))
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 1)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 2))
+            }
+            // While a search is on, the cell says why it matched — the bracketed snippet the catalog
+            // computed — instead of the name every other cell shares a prefix of.
+            Text(captionText)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .help(item.name)
             Spacer(minLength: 0)
             if let duration = item.durationDisplay {
                 Text(duration).monospacedDigit()
@@ -111,5 +136,12 @@ public struct MediaCellView: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 4)
         .padding(.vertical, 3)
+    }
+
+    private var captionText: String {
+        guard let snippet = model.searchSnippets[item.id], !snippet.isEmpty else { return item.name }
+        return snippet
+            .replacingOccurrences(of: "[", with: "")
+            .replacingOccurrences(of: "]", with: "")
     }
 }

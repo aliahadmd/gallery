@@ -41,20 +41,36 @@ public final class MediaLibraryModel {
     /// Set by the toolbar's sort menu. A `var` on purpose: it is the user's choice, not derived state.
     public var sort: MediaSort = .default
 
-    /// The tile the user clicked, and the photo the viewer is showing. Both are ids rather than copied rows:
-    /// pass B fills in a pixel size minutes after a page lands, and a snapshot would leave the inspector
-    /// describing a row that no longer exists in that shape.
+    /// The tile(s) the user clicked, and the photo the viewer is showing. `selectedID` is the primary — the
+    /// one the inspector describes and Return opens — and `selectedIDs` is everything a batch action touches.
+    /// Ids rather than copied rows: pass B fills in a pixel size minutes after a page lands, and a snapshot
+    /// would leave the inspector describing a row that no longer exists in that shape.
+    public private(set) var selectedIDs: Set<MediaID> = []
     public private(set) var selectedID: MediaID?
+    private var selectionAnchor: MediaID?
     public private(set) var viewerID: MediaID?
     /// The trailing inspector. Open by default, because "what is this photo" is the question a gallery
     /// exists to answer, not a power feature.
     public var isInspectorPresented = true
+    /// Which columns the split view is showing, driven by ⌘1/⌘2.
+    public var panels: PanelLayout = .all
+
+    public enum PanelLayout: Sendable { case all, detailOnly }
+
+    /// Trash is emptied after this long, the same month Finder's Trash keeps things. Manual Delete Forever
+    /// exists for people who would rather not wait.
+    public static let trashRetention: TimeInterval = 30 * 24 * 60 * 60
 
     /// Date shelves, from the catalog: days keep only buckets with enough photos to be a real day.
     public private(set) var days: [Album] = []
     public private(set) var months: [Album] = []
     /// Place albums. A cluster nobody has named yet still appears, titled by its coordinates.
     public private(set) var places: [Album] = []
+    /// One level of folder albums per source, keyed by the source they belong to.
+    public private(set) var subfolders: [SourceID: [Album]] = [:]
+
+    /// The snippet each search hit matched on, so a result can show *why* it is in the list.
+    public private(set) var searchSnippets: [MediaID: String] = [:]
 
     /// What the search field shows, and what its last settled keystroke actually searched for. Two properties
     /// because typing must not wait for SQLite, and a half-typed word must not replace the grid.
@@ -73,6 +89,10 @@ public final class MediaLibraryModel {
     private let passB: MetadataWorker
     private let thumbnails: ThumbnailService
     private let catalog: Catalog
+    private let resolver: any MediaResolving
+    /// Files behind the cells that have been on screen. A window report already resolves them for the
+    /// thumbnail window; keeping the answer is what makes a drag to Finder synchronous.
+    private var knownURLs: [MediaID: URL] = [:]
     /// The clips the viewer has open. Owned by the model rather than the view so a SwiftUI rebuild cannot
     /// silently orphan a playing `AVPlayer`.
     private let players: PlayerPool
@@ -96,6 +116,7 @@ public final class MediaLibraryModel {
         self.passB = passB
         self.thumbnails = thumbnails
         self.catalog = catalog
+        self.resolver = resolver
         self.players = PlayerPool(resolver: resolver)
         self.trash = TrashService(catalog: catalog, resolver: resolver, root: trashRoot)
         self.locations = LocationDeriver(catalog: catalog, geocoder: geocoder)
@@ -154,6 +175,7 @@ public final class MediaLibraryModel {
         // enqueued, so there is nothing half-made to read, and a folder the walk is still listing is a folder
         // whose first pages could already have posters.
         await passB.start()
+        await purgeExpiredTrash()
 
         do {
             let resolved = try await coordinator.resolveSources()
@@ -225,6 +247,13 @@ public final class MediaLibraryModel {
 
     public func refreshSources() async {
         sources = (try? await reader.sources()) ?? []
+        // One level of folder albums per source. The reader derives them from `parent_rel`, so a new
+        // subfolder shows up here as soon as the walk has written its rows.
+        var fresh: [SourceID: [Album]] = [:]
+        for source in sources {
+            fresh[source.id] = (try? await reader.albums(of: .folder(source.id))) ?? []
+        }
+        subfolders = fresh
     }
 
     /// The folder picker's destination: grant, register, scan. Several at once, because the panel allows it
@@ -292,7 +321,9 @@ public final class MediaLibraryModel {
         selection = album
         // The rows behind the viewer are about to be a different set; a selection that survived would be a
         // photo the user can no longer see. A search belongs to the album it was typed in, so it goes too.
+        selectedIDs = []
         selectedID = nil
+        selectionAnchor = nil
         viewerID = nil
         clearSearch()
         // The old album's rows must not sit under the new album's title for even one frame.
@@ -312,6 +343,7 @@ public final class MediaLibraryModel {
             searchTask = nil
             guard isSearching else { return }
             appliedSearch = ""
+            searchSnippets = [:]
             Task { await self.reload() }
             return
         }
@@ -337,6 +369,12 @@ public final class MediaLibraryModel {
             hasMorePages = false
             items = hits.map(\.item)
             rowCount = items.count
+            searchSnippets = Dictionary(hits.map { ($0.item.id, $0.snippet) },
+                                        uniquingKeysWith: { first, _ in first })
+            // The rows behind the results are a different set, so a selection from the previous query is
+            // not something the user can still see.
+            selectedIDs = selectedIDs.intersection(Set(items.map(\.id)))
+            if let selectedID, !selectedIDs.contains(selectedID) { self.selectedID = selectedIDs.first }
             visibleCells = visibleCells.intersection(Set(items.map(\.id)))
         } catch {
             guard stamp == generation else { return }
@@ -349,6 +387,7 @@ public final class MediaLibraryModel {
         searchTask = nil
         searchFieldText = ""
         appliedSearch = ""
+        searchSnippets = [:]
     }
 
     /// Restart the cursor and fetch the first page.
@@ -379,6 +418,14 @@ public final class MediaLibraryModel {
             // just because SwiftUI kept its view alive. Without this the window keeps prefetching pictures
             // the user switched away from.
             let stillOnScreen = Set(page.items.map(\.id))
+            // A selection (or a known file URL) that is no longer on the page is a row the user cannot act
+            // on; keeping it would make ⌘⌫ delete something that is not visible.
+            selectedIDs = selectedIDs.intersection(stillOnScreen)
+            if let selectedID, !stillOnScreen.contains(selectedID) { self.selectedID = selectedIDs.first }
+            if let anchor = selectionAnchor, !stillOnScreen.contains(anchor) {
+                selectionAnchor = selectedIDs.first
+            }
+            knownURLs = knownURLs.filter { stillOnScreen.contains($0.key) }
             let leftTheAlbum = visibleCells.subtracting(stillOnScreen)
             if !leftTheAlbum.isEmpty {
                 visibleCells = stillOnScreen.intersection(visibleCells)
@@ -443,7 +490,15 @@ public final class MediaLibraryModel {
         let shown = items.filter { visibleCells.contains($0.id) }
         await thumbnails.setWindow(shown.map { .init(item: $0) }, bucket: .gridLarge)
         await passB.raisePriority(mediaIDs: shown.map(\.id))
+        // The same query the pixel service would make, kept: a drag to Finder has to answer synchronously,
+        // and "where is this file" is already known for every cell the user can see.
+        let targets = await resolver.targets(for: shown.map(\.id))
+        for (id, target) in targets { knownURLs[id] = target.url }
     }
+
+    /// The file behind a cell, for dragging it out. Nil until the cell has been on screen once; a drag from
+    /// a cell that has never reported has no URL to offer, and Finder shows nothing rather than a dead file.
+    public func fileURL(for item: MediaItem) -> URL? { knownURLs[item.id] }
 
     /// A flick has to land on a picture, and a settled scroll reads like a flick to nothing but a timer.
     /// Long enough that one gesture is one report, short enough that the decode lane starts on the row the
@@ -459,20 +514,65 @@ public final class MediaLibraryModel {
         return items.first { $0.id == selectedID }
     }
 
+    /// Everything a batch action touches, in page order.
+    public var selectedItems: [MediaItem] {
+        items.filter { selectedIDs.contains($0.id) }
+    }
+
+    public var selectedMediaIDs: [MediaID] { selectedItems.map(\.id) }
+
     public var viewerItem: MediaItem? {
         guard let viewerID else { return nil }
         return items.first { $0.id == viewerID }
     }
 
-    public func select(_ id: MediaID?) {
-        selectedID = id
+    /// A click, ⌘-click or ⇧-click. The anchor is the last row clicked without ⇧ — the range a ⇧-click
+    /// extends from is the one the user built up, not the alphabetically nearest one.
+    public func select(_ id: MediaID?, extending: Bool = false, range: Bool = false) {
+        guard let id, items.contains(where: { $0.id == id }) else {
+            selectedIDs = []
+            selectedID = nil
+            selectionAnchor = nil
+            return
+        }
+        if range, let anchor = selectionAnchor,
+           let start = items.firstIndex(where: { $0.id == anchor }),
+           let end = items.firstIndex(where: { $0.id == id }) {
+            let bounds = start <= end ? start...end : end...start
+            selectedIDs = Set(items[bounds].map(\.id))
+            selectedID = id
+        } else if extending {
+            if selectedIDs.contains(id) {
+                selectedIDs.remove(id)
+                if selectedID == id { selectedID = selectedIDs.isEmpty ? nil : items.last { selectedIDs.contains($0.id) }?.id }
+            } else {
+                selectedIDs.insert(id)
+                selectedID = id
+            }
+            selectionAnchor = id
+        } else {
+            selectedIDs = [id]
+            selectedID = id
+            selectionAnchor = id
+        }
+    }
+
+    /// ⌘A. The whole loaded page, not the whole library: a shortcut that silently selected a hundred
+    /// thousand rows the grid has never drawn would make ⌘⌫ unthinkable.
+    public func selectAll() {
+        guard !items.isEmpty else { return }
+        selectedIDs = Set(items.map(\.id))
+        selectedID = items.first?.id
+        selectionAnchor = items.first?.id
     }
 
     /// Double-click, or Return on the selection. Selection follows the viewer, so closing it leaves the
     /// inspector on the photo the user was just looking at.
     public func openViewer(_ id: MediaID) {
         guard items.contains(where: { $0.id == id }) else { return }
+        selectedIDs = [id]
         selectedID = id
+        selectionAnchor = id
         viewerID = id
     }
 
@@ -494,7 +594,9 @@ public final class MediaLibraryModel {
         let next = min(max(landed + delta, 0), items.count - 1)
         guard next != landed else { return }
         self.viewerID = items[next].id
+        selectedIDs = [items[next].id]
         selectedID = items[next].id
+        selectionAnchor = self.viewerID
         // Whatever the previous step opened is stopped before its layer is replaced.
         players.evict(except: self.viewerID)
     }
@@ -527,6 +629,21 @@ public final class MediaLibraryModel {
             items[index].isFavorite = wanted
         } catch {
             notices.append(Notice("Could not change the favorite.", detail: "\(error)"))
+        }
+    }
+
+    /// The toolbar's star when more than one row is selected: all favorite, or all unfavorite.
+    public func toggleFavoriteSelection() async {
+        let chosen = selectedItems
+        guard !chosen.isEmpty else { return }
+        let wanted = !chosen.allSatisfy(\.isFavorite)
+        do {
+            try await catalog.setFavorites(chosen.map(\.id), wanted)
+            for index in items.indices where selectedIDs.contains(items[index].id) {
+                items[index].isFavorite = wanted
+            }
+        } catch {
+            notices.append(Notice("Could not change the favorites.", detail: "\(error)"))
         }
     }
 
@@ -568,6 +685,16 @@ public final class MediaLibraryModel {
         await refreshAlbums()
     }
 
+    /// The monthly sweep behind "Recently Deleted", run at launch. Silent: there is nothing to tell the user
+    /// about a file they asked to delete a month ago.
+    private func purgeExpiredTrash() async {
+        let cutoff = Date().addingTimeInterval(-Self.trashRetention)
+        let outcome = await trash.purgeExpired(olderThan: cutoff)
+        guard !outcome.purged.isEmpty else { return }
+        await refreshAlbums()
+        await reload()
+    }
+
     private func report(_ failures: [MediaID: String], what: String) {
         guard !failures.isEmpty else { return }
         let detail = failures.values.sorted().first
@@ -594,8 +721,46 @@ public final class MediaLibraryModel {
         case .day(let bucket): return days.first { $0.kind == .day(bucket) }?.title ?? "Day"
         case .month(let bucket): return months.first { $0.kind == .month(bucket) }?.title ?? "Month"
         case .location(let id): return places.first { $0.kind == .location(id) }?.title ?? "Place"
+        case .subfolder(let sourceID, let path):
+            if let match = subfolders[sourceID]?.first(where: {
+                $0.kind == .subfolder(sourceID, relativePath: path)
+            }) { return match.title }
+            return path.split(separator: "/").last.map(String.init) ?? path
         default: return selection.uiTitle(sources: sources)
         }
+    }
+
+    // MARK: - Day sections
+
+    /// One header per capture day, in the order the page is sorted. Only for the date sort: under "Name" a
+    /// day header would be a claim about an ordering that is not being shown.
+    public struct DaySection: Identifiable, Sendable, Hashable {
+        public var id: Int32 { bucket }
+        public let bucket: Int32
+        public let title: String
+        public let items: [MediaItem]
+    }
+
+    public var daySections: [DaySection] {
+        guard sort.field == .captureDate, !items.isEmpty else { return [] }
+        var order: [Int32] = []
+        var grouped: [Int32: [MediaItem]] = [:]
+        for item in items {
+            let bucket = item.dayBucket
+            if grouped[bucket] == nil { order.append(bucket) }
+            grouped[bucket, default: []].append(item)
+        }
+        return order.map { DaySection(bucket: $0, title: Self.title(forDay: $0), items: grouped[$0] ?? []) }
+    }
+
+    static func title(forDay bucket: Int32) -> String {
+        guard bucket > 20_000_000 else { return "Undated" }
+        var components = DateComponents()
+        components.year = Int(bucket) / 10_000
+        components.month = (Int(bucket) / 100) % 100
+        components.day = Int(bucket) % 100
+        guard let date = Calendar(identifier: .gregorian).date(from: components) else { return "Undated" }
+        return date.formatted(.dateTime.weekday(.wide).month(.wide).day().year())
     }
 
     /// The folder a selection belongs to, for the header and the HUD.

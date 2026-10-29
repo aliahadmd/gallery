@@ -19,6 +19,17 @@ struct GalleryApp: App {
                 GalleryCommands(model: model)
             }
         }
+
+        // A second surface for the same viewer. A `Window`, not a `WindowGroup`: one photo is open, so a
+        // second viewer window would be a second view of the same state, and ⌘⏎ brings it forward.
+        Window("Viewer", id: "viewer") {
+            if let model = container.model {
+                ViewerWindow(model: model)
+            } else {
+                Text("Gallery could not open.")
+            }
+        }
+        .defaultSize(width: 1100, height: 760)
     }
 
     /// A library that will not open is a message, not an empty grid: the difference between "you have no
