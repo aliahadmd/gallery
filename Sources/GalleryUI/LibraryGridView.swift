@@ -130,8 +130,8 @@ public struct LibraryGridView: View {
             if let progress = model.activeProgress, progress.phase.isCounting {
                 IndexProgressHUD(
                     progress: progress,
-                    onPause: model.canControlScan(progress)
-                        ? { Task { await model.setPaused(progress.sourceID, !progress.isPaused) } } : nil,
+                    onPause: model.canPauseScan(progress)
+                        ? { Task { await model.pauseScan(progress) } } : nil,
                     onCancel: model.canControlScan(progress)
                         ? { Task { await model.cancelScan(progress.sourceID) } } : nil
                 )

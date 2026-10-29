@@ -11,6 +11,11 @@ public struct AnalysisJob: Sendable, Hashable {
     public var relativePath: String
     public var modificationDate: Date?
     public var dayBucket: Int32
+    /// The file's stamp at claim time: what the analysis row records so a changed file can tell "same bytes"
+    /// from "re-walked".
+    public var statHash: UInt64
+    /// Post-increment: the claim bumps `analysis_attempts`, and this is what the hop decides parking with.
+    public var attempts: Int
 }
 
 /// How far a source's analysis has got. Counted from the same partial index the claim uses.
@@ -33,15 +38,18 @@ public struct AnalysisCounts: Sendable, Hashable {
 enum AnalysisStatements {
     /// Newest first. Nothing on screen waits for analysis, and the files a user just imported are the ones
     /// they are most likely to look at; the partial index gives this order for free.
+    ///
+    /// Images only until the video path lands: an AVFoundation clip has no ImageIO frame, and claiming it now
+    /// would park it as unreadable before it was ever given a chance.
     static let claim = """
     UPDATE media SET analysis_stage = 1, analysis_attempts = analysis_attempts + 1
     WHERE id IN (
       SELECT id FROM media
-      WHERE analysis_stage = 0 AND stage = 3 AND trash = 0
+      WHERE analysis_stage = 0 AND stage = 3 AND trash = 0 AND kind = ?
       ORDER BY cap_day DESC, id DESC
       LIMIT ?
     )
-    RETURNING id, src_id, kind, subtype, rel_path, mtime_ns, cap_day
+    RETURNING id, src_id, kind, subtype, rel_path, mtime_ns, cap_day, stat_hash, analysis_attempts
     """
 
     static let releaseClaims = "UPDATE media SET analysis_stage = 0 WHERE id IN (%@)"
@@ -55,7 +63,7 @@ enum AnalysisStatements {
       COALESCE(SUM(CASE WHEN analysis_stage < 2 THEN 1 ELSE 0 END), 0) AS pending,
       COALESCE(SUM(CASE WHEN analysis_stage = 3 THEN 1 ELSE 0 END), 0) AS parked
     FROM media
-    WHERE stage = 3 AND trash = 0 AND (? IS NULL OR src_id = ?)
+    WHERE stage = 3 AND trash = 0 AND kind = ? AND (? IS NULL OR src_id = ?)
     """
 
     /// `aesthetic` and `is_utility` are on `media` because the sort and the cover queries read them as plain
@@ -134,7 +142,8 @@ extension Catalog {
     /// released by `releaseClaims` or reset by `beginSession` on the next launch.
     public func claimAnalysis(limit: Int) throws -> [AnalysisJob] {
         try handle.write {
-            try handle.query(AnalysisStatements.claim, [.integer(Int64(limit))])
+            try handle.query(AnalysisStatements.claim,
+                             [.integer(Int64(MediaKind.image.rawValue)), .integer(Int64(limit))])
                 .map(CatalogRow.analysisJob)
         }
     }
@@ -218,7 +227,8 @@ extension Catalog {
 
     public func analysisCounts(sourceID: SourceID? = nil) throws -> AnalysisCounts {
         let id = sourceID.map { Value.integer($0.rawValue) } ?? .null
-        guard let row = try handle.firstRow(AnalysisStatements.counts, [id, id]) else {
+        guard let row = try handle.firstRow(AnalysisStatements.counts,
+                                            [.integer(Int64(MediaKind.image.rawValue)), id, id]) else {
             return AnalysisCounts()
         }
         return AnalysisCounts(

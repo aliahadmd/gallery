@@ -34,8 +34,19 @@ struct GalleryCommands: Commands {
             .keyboardShortcut("3", modifiers: .command)
         }
 
-        CommandMenu("Photo") {
-            Button("Open") {
+        CommandMenu("Analysis") {
+            Button(model.analysisPaused ? "Resume Analysis" : "Pause Analysis") {
+                Task { await model.setAnalysisPaused(!model.analysisPaused) }
+            }
+            .disabled(!model.hasAnalysis)
+
+            Button("Analyze Library Again") {
+                Task { await model.reanalyzeLibrary() }
+            }
+            .disabled(!model.hasAnalysis)
+        }
+
+        CommandMenu("Photo") {            Button("Open") {
                 if let id = model.selectedID { model.openViewer(id) }
             }
             .keyboardShortcut(.return, modifiers: [])

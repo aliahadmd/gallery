@@ -159,7 +159,9 @@ enum CatalogRow {
             subtype: MediaSubtype(rawValue: Int32(truncatingIfNeeded: try row.int64(named: "subtype"))),
             relativePath: try row.string(named: "rel_path"),
             modificationDate: try row.optionalInt64(named: "mtime_ns").map(Date.init(nanoseconds:)),
-            dayBucket: Int32(truncatingIfNeeded: try row.int64(named: "cap_day"))
+            dayBucket: Int32(truncatingIfNeeded: try row.int64(named: "cap_day")),
+            statHash: try row.int64(named: "stat_hash").statHashValue,
+            attempts: Int(try row.int64(named: "analysis_attempts"))
         )
     }
 

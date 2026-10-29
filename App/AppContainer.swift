@@ -1,4 +1,5 @@
 import Foundation
+import GalleryAnalysis
 import GalleryCatalog
 import GalleryImaging
 import GalleryIndexing
@@ -32,11 +33,16 @@ final class AppContainer {
             let thumbnails = ThumbnailService(catalog: catalog, store: store, resolver: resolver)
             let worker = MetadataWorker(catalog: catalog, reader: reader,
                                         resolver: resolver, thumbnails: thumbnails)
+            // The third pass waits for the drain. The gate is a closure rather than a reference to the whole
+            // worker so the analysis actor only knows "is someone else using the machine".
+            let analysis = AnalysisWorker(catalog: catalog, resolver: resolver,
+                                          configuration: .init(gate: { await worker.isRunning }))
 
             model = MediaLibraryModel(reader: reader, coordinator: coordinator, passB: worker,
                                       thumbnails: thumbnails, catalog: catalog, resolver: resolver,
                                       trashRoot: url.deletingLastPathComponent()
-                                          .appendingPathComponent("GalleryTrash", isDirectory: true))
+                                          .appendingPathComponent("GalleryTrash", isDirectory: true),
+                                      analysis: analysis)
             startupFailure = nil
         } catch {
             model = nil

@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import Observation
+import GalleryAnalysis
 import GalleryDomain
 import GalleryCatalog
 import GalleryIndexing
@@ -66,6 +67,11 @@ public final class MediaLibraryModel {
     public private(set) var months: [Album] = []
     /// Place albums. A cluster nobody has named yet still appears, titled by its coordinates.
     public private(set) var places: [Album] = []
+    /// Tag albums from the analysis pass, and the pass's own numbers (kept apart from the drain's so a
+    /// finished analysis cannot mask an active scan in the HUD).
+    public private(set) var tags: [Album] = []
+    public private(set) var analysisProgress: [SourceID: IndexProgress] = [:]
+    private var analysisFeed: Task<Void, Never>?
     /// One level of folder albums per source, keyed by the source they belong to.
     public private(set) var subfolders: [SourceID: [Album]] = [:]
 
@@ -98,6 +104,9 @@ public final class MediaLibraryModel {
     private let players: PlayerPool
     private let trash: TrashService
     private let locations: LocationDeriver
+    /// Nil when the caller does not want a third pass at all — every unit test, and any future build that
+    /// ships without Vision. The app always passes one.
+    private let analysis: AnalysisWorker?
     private var cursor: SortCursor?
     private var generation = 0
     private var feed: Task<Void, Never>?
@@ -110,7 +119,8 @@ public final class MediaLibraryModel {
 
     public init(reader: CatalogReader, coordinator: IndexCoordinator, passB: MetadataWorker,
                 thumbnails: ThumbnailService, catalog: Catalog, resolver: any MediaResolving,
-                trashRoot: URL, geocoder: any ReverseGeocoding = AppleGeocoder()) {
+                trashRoot: URL, geocoder: any ReverseGeocoding = AppleGeocoder(),
+                analysis: AnalysisWorker? = nil) {
         self.reader = reader
         self.coordinator = coordinator
         self.passB = passB
@@ -120,6 +130,7 @@ public final class MediaLibraryModel {
         self.players = PlayerPool(resolver: resolver)
         self.trash = TrashService(catalog: catalog, resolver: resolver, root: trashRoot)
         self.locations = LocationDeriver(catalog: catalog, geocoder: geocoder)
+        self.analysis = analysis
     }
 
     // MARK: - Lifecycle
@@ -150,6 +161,26 @@ public final class MediaLibraryModel {
             }
         }
 
+        // The third pass reports through its own feed. It runs behind pass B (the worker's gate), so starting
+        // it here is a promise rather than a race: it will idle until the drain says it is done.
+        if let analysis {
+            let analysisStream = await analysis.progressFeed()
+            analysisFeed = Task { [weak self] in
+                for await update in analysisStream {
+                    guard let self else { return }
+                    let was = self.analysisProgress[update.sourceID]
+                    self.analysisProgress[update.sourceID] = update
+                    if update.phase == .finished, update != was {
+                        // Tags and recognised text are only worth a shelf refresh once a source is done: the
+                        // shelf is a handful of rows, but re-reading it on every 100 ms frame would be churn
+                        // for a count nobody can watch climb.
+                        await self.refreshTags()
+                        await self.reload()
+                    }
+                }
+            }
+        }
+
         let stream = await coordinator.progressFeed()
         feed = Task { [weak self] in
             for await update in stream {
@@ -175,6 +206,7 @@ public final class MediaLibraryModel {
         // enqueued, so there is nothing half-made to read, and a folder the walk is still listing is a folder
         // whose first pages could already have posters.
         await passB.start()
+        await analysis?.start()
         await purgeExpiredTrash()
 
         do {
@@ -191,7 +223,37 @@ public final class MediaLibraryModel {
         await refreshSources()
         await refreshAlbums()
         await refreshPlaces()
+        await refreshTags()
         await reload()
+    }
+
+    /// The tag shelf, from the analysis pass. Cheap by construction: one grouped count over a small table.
+    public func refreshTags() async {
+        tags = (try? await reader.tagAlbums()) ?? []
+    }
+
+    /// Pause/resume the third pass. The worker publishes a snapshot when it changes, so the HUD follows
+    /// without this method having to guess.
+    public func setAnalysisPaused(_ paused: Bool) async {
+        await analysis?.setPaused(paused)
+    }
+
+    public var analysisPaused: Bool {
+        analysisProgress.values.contains { $0.isPaused }
+    }
+
+    /// Whether this process runs a third pass at all. The menu hides its items when it does not.
+    public var hasAnalysis: Bool { analysis != nil }
+
+    /// Drop every derived analysis row and walk the library again. Explorer-level, deliberately a menu item
+    /// rather than something a scan triggers.
+    public func reanalyzeLibrary() async {
+        guard let analysis else { return }
+        do {
+            try await analysis.reanalyze()
+        } catch {
+            notices.append(Notice("The library could not be re-analysed.", detail: "\(error)"))
+        }
     }
 
     /// Days and months are derived from pass B's capture dates, so a scan that just started is a sidebar
@@ -221,6 +283,8 @@ public final class MediaLibraryModel {
         feed = nil
         previewFeed?.cancel()
         previewFeed = nil
+        analysisFeed?.cancel()
+        analysisFeed = nil
         windowFlush?.cancel()
         windowFlush = nil
         // Not awaited: `stop` is the window's `onDisappear`, and a drain that is mid-decode lands its batch
@@ -228,9 +292,11 @@ public final class MediaLibraryModel {
         let worker = passB
         let cache = thumbnails
         let walk = coordinator
+        let analyser = analysis
         Task {
             await walk.stopAllWatching()
             await worker.cancel()
+            await analyser?.cancel()
             await cache.clearWindow()
         }
     }
@@ -721,6 +787,7 @@ public final class MediaLibraryModel {
         case .day(let bucket): return days.first { $0.kind == .day(bucket) }?.title ?? "Day"
         case .month(let bucket): return months.first { $0.kind == .month(bucket) }?.title ?? "Month"
         case .location(let id): return places.first { $0.kind == .location(id) }?.title ?? "Place"
+        case .tag(let key): return TagVocabulary.title(for: key.slug)
         case .subfolder(let sourceID, let path):
             if let match = subfolders[sourceID]?.first(where: {
                 $0.kind == .subfolder(sourceID, relativePath: path)
@@ -782,13 +849,34 @@ public final class MediaLibraryModel {
     /// Showing the walk's finished frame instead would call a folder ready while the grid is still blank.
     public var activeProgress: IndexProgress? {
         let sourceID = sourceForSelection?.id
-        var live = previews.values.filter { sourceID == nil || $0.sourceID == sourceID }
-        live.append(contentsOf: progress.values.filter {
-            $0.phase.isCounting && (sourceID == nil || $0.sourceID == sourceID)
-        })
+        func matches(_ progress: IndexProgress) -> Bool {
+            sourceID == nil || progress.sourceID == sourceID
+        }
+        var live = previews.values.filter(matches)
+        live.append(contentsOf: progress.values.filter { $0.phase.isCounting && matches($0) })
+        live.append(contentsOf: analysisProgress.values.filter { $0.phase == .analyzing && matches($0) })
         return live.max { lhs, rhs in
+            // A library being read is not "up to date": an active analysis frame outranks a finished drain,
+            // which would otherwise win on phase order and hide the work that is actually happening.
+            if lhs.phase == .analyzing, rhs.phase == .finished { return false }
+            if lhs.phase == .finished, rhs.phase == .analyzing { return true }
             if lhs.phase == rhs.phase { return lhs.discovered < rhs.discovered }
             return lhs.phase.order < rhs.phase.order
+        }
+    }
+
+    /// The HUD's pause means one of two things: stop this folder's walk, or hold the library-wide analysis,
+    /// which has no single folder to name.
+    public func canPauseScan(_ progress: IndexProgress) -> Bool {
+        if progress.phase == .analyzing { return true }
+        return canControlScan(progress)
+    }
+
+    public func pauseScan(_ progress: IndexProgress) async {
+        if progress.phase == .analyzing {
+            await setAnalysisPaused(!progress.isPaused)
+        } else {
+            await setPaused(progress.sourceID, !progress.isPaused)
         }
     }
 
@@ -810,8 +898,9 @@ extension IndexPhase {
         case .readingMetadata: 3
         case .deriving: 4
         case .thumbnailing: 5
-        case .watching: 6
-        case .finished: 7
+        case .analyzing: 6
+        case .watching: 7
+        case .finished: 8
         case .failed: -1
         }
     }

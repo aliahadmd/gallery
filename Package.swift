@@ -26,14 +26,23 @@ let package = Package(
             name: "GalleryIndexing",
             dependencies: ["GalleryDomain", "GallerySupport", "GalleryCatalog", "GalleryImaging"]
         ),
+        // Vision lives here and nowhere else: the indexing passes must not grow a dependency on a framework
+        // whose cost is measured in hundreds of milliseconds per file. The resolver protocol is shared with
+        // the indexer, which is the only reason this target depends on it.
+        .target(
+            name: "GalleryAnalysis",
+            dependencies: ["GalleryDomain", "GallerySupport", "GalleryCatalog", "GalleryImaging",
+                           "GalleryIndexing"]
+        ),
         .target(
             name: "GalleryUI",
-            dependencies: ["GalleryDomain", "GallerySupport", "GalleryCatalog", "GalleryIndexing"]
+            dependencies: ["GalleryDomain", "GallerySupport", "GalleryCatalog", "GalleryIndexing",
+                           "GalleryAnalysis"]
         ),
         .executableTarget(
             name: "GalleryApp",
             dependencies: ["GalleryDomain", "GallerySupport", "GallerySQLite", "GalleryCatalog",
-                           "GalleryImaging", "GalleryIndexing", "GalleryUI"],
+                           "GalleryImaging", "GalleryIndexing", "GalleryAnalysis", "GalleryUI"],
             path: "App",
             exclude: ["Info.plist", "Gallery.entitlements"]
         ),
@@ -56,6 +65,11 @@ let package = Package(
             name: "GalleryUITests",
             dependencies: ["GalleryUI", "GalleryIndexing", "GalleryImaging", "GalleryCatalog",
                            "GalleryDomain", "GallerySupport"]
+        ),
+        .testTarget(
+            name: "GalleryAnalysisTests",
+            dependencies: ["GalleryAnalysis", "GalleryImaging", "GalleryCatalog", "GalleryDomain",
+                           "GalleryIndexing", "GallerySupport"]
         )
     ]
 )

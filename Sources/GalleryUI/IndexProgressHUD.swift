@@ -42,6 +42,15 @@ struct IndexProgressHUD: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+            } else if progress.phase == .analyzing {
+                // The third pass has its own task, so it gets its own bar and its own words: "1,204 of 8,000
+                // analysed" is a different promise from "previews ready", and the grid is already complete.
+                ProgressView(value: progress.analysisFraction)
+                    .progressViewStyle(.linear)
+                Text("\(progress.analyzed.formatted()) of \(progress.discovered.formatted()) analysed")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
             } else {
                 ProgressView(value: progress.passBFraction)
                     .progressViewStyle(.linear)
@@ -74,6 +83,7 @@ extension IndexPhase {
         case .readingMetadata: "Reading photo data…"
         case .deriving: "Building albums…"
         case .thumbnailing: "Making previews…"
+        case .analyzing: "Reading scenes and text…"
         case .watching: "Watching for changes"
         case .finished: "Up to date"
         case .failed: "Scan stopped"

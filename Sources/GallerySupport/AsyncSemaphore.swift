@@ -165,4 +165,10 @@ extension AsyncSemaphore {
     public static func videoRead() -> AsyncSemaphore {
         AsyncSemaphore(value: max(2, activeProcessorCount / 4))
     }
+
+    /// Vision is CPU- and ANE-bound and scales badly past a handful of requests in flight — a lane as wide
+    /// as the decode lane would starve the UI's image work for the entire analysis pass.
+    public static func vision() -> AsyncSemaphore {
+        AsyncSemaphore(value: max(1, min(3, activeProcessorCount / 4)))
+    }
 }

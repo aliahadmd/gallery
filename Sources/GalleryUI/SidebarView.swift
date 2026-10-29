@@ -81,6 +81,16 @@ public struct SidebarView: View {
                 }
             }
 
+            // Scene tags from the on-device analyser. Curated slugs only: a shelf of Vision's 1,300 raw
+            // identifiers would be a vocabulary dump, not a gallery.
+            if !model.tags.isEmpty {
+                Section("Tags") {
+                    ForEach(model.tags) { album in
+                        dateRow(album, symbol: tagSymbol(album))
+                    }
+                }
+            }
+
             // Present but empty on purpose: People slots into the navigation without moving anything when
             // face grouping arrives in a later version.
             Section("People") {
@@ -90,6 +100,11 @@ public struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+    }
+
+    private func tagSymbol(_ album: Album) -> String {
+        if case .tag(let key) = album.kind { return TagVocabulary.symbol(for: key.slug) }
+        return "tag"
     }
 
     /// A date album: its count is the catalog's own, so "the sidebar says 12 and the grid shows 12" is true by

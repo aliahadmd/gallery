@@ -8,6 +8,8 @@ public enum IndexPhase: String, Sendable, Hashable, Codable, CaseIterable {
     case readingMetadata
     case deriving
     case thumbnailing
+    /// The third pass: on-device analysis (tags, text, faces). Runs after the drain, never during it.
+    case analyzing
     case watching
     case finished
     case failed
@@ -24,6 +26,8 @@ public struct IndexProgress: Sendable, Hashable, Codable {
     public var failed: Int
     public var queued: Int
     public var isPaused: Bool
+    /// Rows the analyser has finished, when the frame comes from the third pass.
+    public var analyzed: Int
 
     public init(
         sourceID: SourceID,
@@ -33,7 +37,8 @@ public struct IndexProgress: Sendable, Hashable, Codable {
         thumbnailed: Int = 0,
         failed: Int = 0,
         queued: Int = 0,
-        isPaused: Bool = false
+        isPaused: Bool = false,
+        analyzed: Int = 0
     ) {
         self.sourceID = sourceID
         self.phase = phase
@@ -43,6 +48,7 @@ public struct IndexProgress: Sendable, Hashable, Codable {
         self.failed = failed
         self.queued = queued
         self.isPaused = isPaused
+        self.analyzed = analyzed
     }
 
     /// Pass A is done as soon as enumeration finishes — that is the moment the grid becomes honest, and it
@@ -50,7 +56,7 @@ public struct IndexProgress: Sendable, Hashable, Codable {
     /// is really still decoding.
     public var isListingComplete: Bool {
         switch phase {
-        case .sweeping, .readingMetadata, .deriving, .thumbnailing, .watching, .finished: true
+        case .sweeping, .readingMetadata, .deriving, .thumbnailing, .analyzing, .watching, .finished: true
         case .resolving, .enumerating, .failed: false
         }
     }
@@ -58,5 +64,12 @@ public struct IndexProgress: Sendable, Hashable, Codable {
     public var passBFraction: Double {
         guard discovered > 0 else { return 0 }
         return min(1, Double(thumbnailed) / Double(discovered))
+    }
+
+    /// The third pass gets its own fraction rather than reusing `thumbnailed`: a finished grid is not a
+    /// half-analysed library, and a bar that says otherwise is a lie the user will notice.
+    public var analysisFraction: Double {
+        guard discovered > 0 else { return 0 }
+        return min(1, Double(analyzed) / Double(discovered))
     }
 }
