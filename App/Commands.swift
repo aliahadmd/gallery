@@ -64,6 +64,13 @@ struct GalleryCommands: Commands {
             .keyboardShortcut(.return, modifiers: [])
             .disabled(model.selectedID == nil || model.viewerItem != nil)
 
+            Button("Full Screen") {
+                guard let id = model.selectedID else { return }
+                model.openViewer(id, fullscreen: true)
+            }
+            .keyboardShortcut("f", modifiers: [.command, .control])
+            .disabled(model.selectedID == nil || model.viewerItem != nil)
+
             Button("Open in New Window") {
                 guard let id = model.selectedID else { return }
                 model.openViewer(id)

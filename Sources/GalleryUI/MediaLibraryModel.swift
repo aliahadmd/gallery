@@ -165,6 +165,8 @@ public final class MediaLibraryModel {
     /// cleanup possible without loading a thousand rows.
     public private(set) var mediaSelection = MediaSelection()
     public private(set) var viewerID: MediaID?
+    /// Set when the viewer should take the window fullscreen on appear; the view consumes it.
+    public private(set) var viewerWantsFullscreen = false
     /// The photo open in the editor. Nil when the editor is closed; the session lives here rather than in
     /// the view so a SwiftUI rebuild cannot drop an undo stack.
     public private(set) var editingSession: EditingSession?
@@ -985,14 +987,22 @@ public final class MediaLibraryModel {
 
     /// Double-click, or Return on the selection. Selection follows the viewer, so closing it leaves the
     /// inspector on the photo the user was just looking at.
-    public func openViewer(_ id: MediaID) {
+    /// `fullscreen` is the grid's expand button and the Photo menu; a double-click opens the same viewer
+    /// without taking the screen.
+    public func openViewer(_ id: MediaID, fullscreen: Bool = false) {
         guard items.contains(where: { $0.id == id }) else { return }
         mediaSelection.selectOnly(id)
         viewerID = id
+        viewerWantsFullscreen = fullscreen
+    }
+
+    public func consumeFullscreenRequest() {
+        viewerWantsFullscreen = false
     }
 
     public func closeViewer() {
         viewerID = nil
+        viewerWantsFullscreen = false
         // A clip that is still decoding is a clip that will play its audio over the grid the moment it
         // reaches a keyframe. Closing is the end of playback, not a pause the user has to find.
         players.stopAll()

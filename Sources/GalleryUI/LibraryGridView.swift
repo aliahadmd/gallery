@@ -115,11 +115,11 @@ public struct LibraryGridView: View {
 
                         if count == 1 {
                             Button {
-                                model.openViewer(selected.id)
+                                model.openViewer(selected.id, fullscreen: true)
                             } label: {
-                                Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
+                                Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
                             }
-                            .help("Open the selected photo (Return)")
+                            .help("Open the photo full screen; ←/→ change photos, Esc exits")
 
                             if model.canEdit(selected) {
                                 Button {

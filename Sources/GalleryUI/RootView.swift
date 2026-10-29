@@ -45,6 +45,9 @@ public struct RootView: View {
                     .zIndex(3)
             }
         }
+        // The viewer is a full-window surface; the grid's search field and sort menu should not float above
+        // a photo that is filling the screen.
+        .toolbarVisibility(model.viewerItem == nil ? .visible : .hidden, for: .windowToolbar)
         .animation(.easeOut(duration: 0.12), value: model.viewerID)
         .animation(.easeOut(duration: 0.12), value: model.editorID)
         .animation(.easeOut(duration: 0.12), value: model.isCollageOpen)

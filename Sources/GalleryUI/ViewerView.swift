@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import Combine
 import CoreGraphics
 import GalleryDomain
 
@@ -29,6 +30,7 @@ public struct ViewerView: View {
     @State private var isSlideshow = false
 
     @FocusState private var isFocused: Bool
+    @State private var enteredFullscreen = false
 
     public init(model: MediaLibraryModel) {
         self.model = model
@@ -44,7 +46,24 @@ public struct ViewerView: View {
             .focusable()
             .focused($isFocused)
             .focusEffectDisabled()
-            .onAppear { isFocused = true }
+            .onAppear {
+                isFocused = true
+                if model.viewerWantsFullscreen {
+                    model.consumeFullscreenRequest()
+                    enteredFullscreen = WindowFullscreen.enter()
+                }
+            }
+            // A fullscreen transition installs a new window for the same view and drops first responder;
+            // without this the arrows and Esc reach the window instead of the photo.
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+                isFocused = true
+            }
+            .onDisappear {
+                if enteredFullscreen {
+                    enteredFullscreen = false
+                    WindowFullscreen.exit()
+                }
+            }
             .onChange(of: model.viewerID) { _, _ in resetMedia() }
             .onChange(of: model.editorID) { _, editorID in
                 // A slideshow behind the editor would swap the photo the session describes; the editor owns
@@ -84,6 +103,7 @@ public struct ViewerView: View {
             .onKeyPress(.downArrow) { setZoom(zoom / 1.25); return .handled }
             .onKeyPress(.escape) {
                 isSlideshow = false
+                // Esc is the only way out: it closes the viewer, and the disappear above leaves fullscreen.
                 model.closeViewer()
                 return .handled
             }

@@ -85,6 +85,26 @@ import GalleryDomain
         #expect(fixture.model.selectedIDs == [first.id, second.id])
     }
 
+    @Test("The expand entry asks the viewer for fullscreen; a plain open does not")
+    func viewerFullscreenRequest() async throws {
+        let fixture = try await Fixture(files: 3)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+        let id = try #require(fixture.model.items.first).id
+
+        fixture.model.openViewer(id)
+        #expect(!fixture.model.viewerWantsFullscreen)
+
+        fixture.model.closeViewer()
+        fixture.model.openViewer(id, fullscreen: true)
+        #expect(fixture.model.viewerWantsFullscreen)
+
+        fixture.model.consumeFullscreenRequest()
+        #expect(!fixture.model.viewerWantsFullscreen)
+        fixture.model.closeViewer()
+    }
+
     @Test("Typing a search starts a new selection scope")
     func searchResetsSelection() async throws {
         let fixture = try await Fixture(files: 30)
