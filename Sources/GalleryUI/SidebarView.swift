@@ -6,6 +6,7 @@ import GalleryDomain
 /// Date and location albums need pass B's decoded metadata, so listing them now would be an empty promise.
 public struct SidebarView: View {
     private let model: MediaLibraryModel
+    @State private var daysExpanded = false
 
     public init(model: MediaLibraryModel) {
         self.model = model
@@ -42,8 +43,47 @@ public struct SidebarView: View {
                         .tag(album.kind)
                 }
             }
+
+            // Months stay open because there are a dozen of them; days are a disclosure because a library
+            // three years deep is a thousand rows of dates and nobody scrolls that.
+            if !model.months.isEmpty {
+                Section("Months") {
+                    ForEach(model.months) { album in
+                        dateRow(album, symbol: "calendar")
+                    }
+                }
+            }
+            if !model.days.isEmpty {
+                DisclosureGroup(isExpanded: $daysExpanded) {
+                    ForEach(model.days) { album in
+                        dateRow(album, symbol: "calendar.day.timeline.left")
+                    }
+                } label: {
+                    Label("Days", systemImage: "calendar")
+                        .badge(model.days.count)
+                }
+            }
         }
         .listStyle(.sidebar)
+    }
+
+    /// A date album: its count is the catalog's own, so "the sidebar says 12 and the grid shows 12" is true by
+    /// construction rather than by two queries that happen to agree.
+    private func dateRow(_ album: Album, symbol: String) -> some View {
+        Label {
+            HStack(spacing: 6) {
+                Text(album.title).lineLimit(1)
+                Spacer(minLength: 4)
+                Text(album.itemCount.formatted())
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+        } icon: {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+        }
+        .tag(album.kind)
     }
 
     /// Setting the selection starts the page load instead of performing it, because `select` is an actor hop

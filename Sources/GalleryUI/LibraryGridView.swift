@@ -36,6 +36,8 @@ public struct LibraryGridView: View {
         }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
+        .searchable(text: searchBinding, placement: .toolbar,
+                    prompt: Text("Search \(model.selection.uiTitle(sources: model.sources))"))
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if let selected = model.selectedItem {
@@ -103,7 +105,11 @@ public struct LibraryGridView: View {
         }
     }
 
-    private var title: String { model.selection.uiTitle(sources: model.sources) }
+    private var title: String { model.selectionTitle }
+
+    private var searchBinding: Binding<String> {
+        Binding(get: { model.searchFieldText }, set: { model.updateSearch($0) })
+    }
 
     private var inspectorBinding: Binding<Bool> {
         Binding(get: { model.isInspectorPresented }, set: { model.isInspectorPresented = $0 })
@@ -151,6 +157,14 @@ public struct LibraryGridView: View {
                     .foregroundStyle(.secondary)
                 Text("Listing files…").font(.title3)
                 Text("Photos appear as they are found.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else if model.isSearching {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 30, weight: .thin))
+                    .foregroundStyle(.secondary)
+                Text("Nothing matches “\(model.appliedSearch)”.").font(.title3)
+                Text("Search looks at names, folders and the metadata already read.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else {

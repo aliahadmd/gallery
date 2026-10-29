@@ -50,6 +50,18 @@ public final class MediaLibraryModel {
     /// exists to answer, not a power feature.
     public var isInspectorPresented = true
 
+    /// Date shelves, from the catalog: days keep only buckets with enough photos to be a real day.
+    public private(set) var days: [Album] = []
+    public private(set) var months: [Album] = []
+
+    /// What the search field shows, and what its last settled keystroke actually searched for. Two properties
+    /// because typing must not wait for SQLite, and a half-typed word must not replace the grid.
+    public var searchFieldText = ""
+    public private(set) var appliedSearch = ""
+    public var isSearching: Bool { !appliedSearch.isEmpty }
+    private var searchTask: Task<Void, Never>?
+    private static let searchLimit = 500
+
     /// Rows per page. 200 is roughly three screens of tiles, which is what makes the first page arrive
     /// before the scan has listed the tenth directory.
     private static let pageSize = 200
@@ -101,6 +113,9 @@ public final class MediaLibraryModel {
                 // Only on a change: a small folder's first and only frame can already be "finished", and a
                 // repeated frame of the same numbers is not a new answer worth throwing away a cursor for.
                 if update.phase == .finished, update != was {
+                    // Capture dates are what the day and month shelves are made of, and the drain is what
+                    // writes them.
+                    await self.refreshAlbums()
                     await self.reload()
                 }
             }
@@ -113,6 +128,7 @@ public final class MediaLibraryModel {
                 self.progress[update.sourceID] = update
                 if update.phase == .finished || update.phase == .failed {
                     await self.refreshSources()
+                    await self.refreshAlbums()
                     await self.reload()
                     // The walk just queued files pass B has never seen. If its previous drain ended with an
                     // empty queue, nothing else would start another one.
@@ -140,7 +156,20 @@ public final class MediaLibraryModel {
             notices.append(Notice("Could not reopen the library.", detail: "\(error)"))
         }
         await refreshSources()
+        await refreshAlbums()
         await reload()
+    }
+
+    /// Days and months are derived from pass B's capture dates, so a scan that just started is a sidebar
+    /// with no dates in it yet — the feed refreshes these when a pass reports new rows.
+    ///
+    /// Both queries run before either shelf is replaced: a UI that updates between the two awaits would
+    /// render a sidebar with days and no months for one frame.
+    public func refreshAlbums() async {
+        let freshDays = (try? await reader.dateAlbums()) ?? []
+        let freshMonths = (try? await reader.monthAlbums()) ?? []
+        days = freshDays
+        months = freshMonths
     }
 
     public func stop() {
@@ -237,19 +266,77 @@ public final class MediaLibraryModel {
         guard album != selection else { return }
         selection = album
         // The rows behind the viewer are about to be a different set; a selection that survived would be a
-        // photo the user can no longer see.
+        // photo the user can no longer see. A search belongs to the album it was typed in, so it goes too.
         selectedID = nil
         viewerID = nil
+        clearSearch()
+        // The old album's rows must not sit under the new album's title for even one frame.
+        items = []
         await reload()
+    }
+
+    // MARK: - Search
+
+    /// Typing is debounced: 200 ms after the last keystroke, one query. The field keeps the raw text so it
+    /// never lags behind the keyboard.
+    public func updateSearch(_ text: String) {
+        searchFieldText = text
+        searchTask?.cancel()
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            searchTask = nil
+            guard isSearching else { return }
+            appliedSearch = ""
+            Task { await self.reload() }
+            return
+        }
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled else { return }
+            await self?.runSearch(query)
+        }
+    }
+
+    /// Search is scoped to the album it was typed in: the field sits in that album's toolbar, and a filter
+    /// that silently reached across the whole library would make "Problems" and "Favorites" mean nothing.
+    /// Selecting "All Media" is how the user asks for the whole library.
+    private func runSearch(_ query: String) async {
+        generation += 1
+        let stamp = generation
+        do {
+            let hits = try await reader.search(query, within: selection, prefix: true,
+                                               limit: Self.searchLimit)
+            guard stamp == generation, !Task.isCancelled else { return }
+            appliedSearch = query
+            cursor = nil
+            hasMorePages = false
+            items = hits.map(\.item)
+            rowCount = items.count
+            visibleCells = visibleCells.intersection(Set(items.map(\.id)))
+        } catch {
+            guard stamp == generation else { return }
+            notices.append(Notice("The search could not be run.", detail: "\(error)"))
+        }
+    }
+
+    private func clearSearch() {
+        searchTask?.cancel()
+        searchTask = nil
+        searchFieldText = ""
+        appliedSearch = ""
     }
 
     /// Restart the cursor and fetch the first page.
     public func reload() async {
+        // A reload triggered by a scan or a drain must not throw the user's search results away — it re-runs
+        // the same search, which is what "new rows landed" means while a filter is on.
+        if isSearching {
+            await runSearch(appliedSearch)
+            return
+        }
         generation += 1
         let stamp = generation
         cursor = nil
-        items = []
-        hasMorePages = false
         isLoadingPage = true
         defer { if stamp == generation { isLoadingPage = false } }
 
@@ -257,6 +344,9 @@ public final class MediaLibraryModel {
             rowCount = try await reader.count(album: selection)
             let page = try await reader.page(album: selection, sort: sort, limit: Self.pageSize)
             guard stamp == generation else { return }
+            // Replace rather than clear-then-fill: a scan finishing in the background re-runs this while the
+            // user is looking at the page, and blanking the grid first is a flash of "no photos" for as long
+            // as the query takes.
             items = page.items
             cursor = page.nextCursor
             hasMorePages = page.hasMore
@@ -277,7 +367,7 @@ public final class MediaLibraryModel {
 
     /// Called by the grid when the last visible cell is near the end of what is loaded.
     public func loadMore() async {
-        guard hasMorePages, !isLoadingPage, let cursor else { return }
+        guard hasMorePages, !isLoadingPage, !isSearching, let cursor else { return }
         generation += 1
         let stamp = generation
         isLoadingPage = true
@@ -423,6 +513,17 @@ public final class MediaLibraryModel {
     }
 
     // MARK: - Derived view state
+
+    /// The header over the grid. A search is titled by what was searched for, because "All Media" over two
+    /// matching photos is a claim about the library that the page is not showing.
+    public var selectionTitle: String {
+        if isSearching { return "Search “\(appliedSearch)”" }
+        switch selection {
+        case .day(let bucket): return days.first { $0.kind == .day(bucket) }?.title ?? "Day"
+        case .month(let bucket): return months.first { $0.kind == .month(bucket) }?.title ?? "Month"
+        default: return selection.uiTitle(sources: sources)
+        }
+    }
 
     /// The folder a selection belongs to, for the header and the HUD.
     public var sourceForSelection: FolderSource? {

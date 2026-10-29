@@ -510,4 +510,119 @@ final class Fixture {
         #expect(fixture.model.viewerItem?.id == items[index + 1].id)
         #expect(lease.player.currentItem == nil, "the clip that left the screen was torn down")
     }
+
+    @Test("Capture dates become day albums once the drain has read them")
+    func dayAlbumsAppearAfterDrain() async throws {
+        let fixture = try await Fixture(files: 0)
+        defer { await fixture.tearDown() }
+        let day = Date(timeIntervalSince1970: 1_700_000_000)
+        for index in 0..<4 {
+            try fixture.writeJPEG(named: "IMG_\(index).jpg")
+            try FileManager.default.setAttributes(
+                [.modificationDate: day.addingTimeInterval(Double(index))],
+                ofItemAtPath: fixture.media.appendingPathComponent("IMG_\(index).jpg").path
+            )
+        }
+
+        await fixture.model.start()
+        await fixture.model.add([fixture.media])
+        try await fixture.waitUntilIdle(fixture.coordinator)
+        try await fixture.waitUntil {
+            !fixture.model.days.isEmpty && !fixture.model.months.isEmpty
+                && fixture.model.previews.values.contains { $0.phase == .finished }
+        }
+
+        #expect(fixture.model.days.count == 1, "four photos taken within seconds of each other are one day")
+        #expect(fixture.model.days.first?.itemCount == 4)
+        #expect(fixture.model.months.count == 1)
+        fixture.model.stop()
+    }
+
+    @Test("Selecting a day narrows the grid to that day, and the count matches")
+    func selectingADayNarrowsTheGrid() async throws {
+        let fixture = try await Fixture(files: 0)
+        defer { await fixture.tearDown() }
+        let recent = Date(timeIntervalSince1970: 1_700_000_000)
+        let older = recent.addingTimeInterval(-60 * 86_400)
+        for index in 0..<3 {
+            try fixture.writeJPEG(named: "recent_\(index).jpg")
+            try FileManager.default.setAttributes(
+                [.modificationDate: recent.addingTimeInterval(Double(index))],
+                ofItemAtPath: fixture.media.appendingPathComponent("recent_\(index).jpg").path
+            )
+            try fixture.writeJPEG(named: "older_\(index).jpg")
+            try FileManager.default.setAttributes(
+                [.modificationDate: older.addingTimeInterval(Double(index))],
+                ofItemAtPath: fixture.media.appendingPathComponent("older_\(index).jpg").path
+            )
+        }
+
+        await fixture.model.start()
+        await fixture.model.add([fixture.media])
+        try await fixture.waitUntilIdle(fixture.coordinator)
+        try await fixture.waitUntil { fixture.model.days.count == 2 }
+
+        let oldest = try #require(fixture.model.days.last, "days are newest first")
+        #expect(oldest.itemCount == 3)
+        await fixture.model.select(oldest.kind)
+        // A scan's finished frame can start a background reload at any moment, so the assertion is on the
+        // effect the selection produces, not on the instant `select` returns.
+        try await fixture.waitUntil { fixture.model.items.count == 3 }
+
+        #expect(fixture.model.rowCount == oldest.itemCount, "the sidebar's number is the grid's number")
+        #expect(fixture.model.items.allSatisfy { $0.name.hasPrefix("older_") })
+        #expect(fixture.model.selectionTitle == oldest.title)
+        fixture.model.stop()
+    }
+
+    @Test("Search filters the grid, and clearing it restores the album")
+    func searchFiltersAndRestores() async throws {
+        let fixture = try await Fixture(files: 0)
+        defer { await fixture.tearDown() }
+        for name in ["kyoto_1.jpg", "kyoto_2.jpg", "beach_1.jpg"] {
+            try fixture.writeJPEG(named: name)
+        }
+
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+        #expect(fixture.model.items.count == 3)
+
+        fixture.model.updateSearch("kyoto")
+        try await fixture.waitUntil { fixture.model.isSearching && fixture.model.items.count == 2 }
+
+        #expect(fixture.model.items.allSatisfy { $0.name.lowercased().contains("kyoto") })
+        #expect(fixture.model.selectionTitle.contains("kyoto"))
+        #expect(fixture.model.rowCount == 2)
+
+        fixture.model.updateSearch("")
+        try await fixture.waitUntil { !fixture.model.isSearching && fixture.model.items.count == 3 }
+        #expect(fixture.model.selectionTitle != "Search “kyoto”")
+    }
+
+    @Test("Search is scoped to the album it was typed in")
+    func searchRespectsTheAlbum() async throws {
+        let fixture = try await Fixture(files: 0)
+        defer { await fixture.tearDown() }
+        try fixture.writeJPEG(named: "kyoto_photo.jpg")
+        try Data([0xFF, 0xD8]).write(to: fixture.media.appendingPathComponent("kyoto_clip.mov"))
+
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        await fixture.model.select(.allVideos)
+        fixture.model.updateSearch("kyoto")
+        try await fixture.waitUntil {
+            fixture.model.isSearching && fixture.model.items.count == 1
+                && fixture.model.items.allSatisfy { $0.kind == .video }
+        }
+        #expect(fixture.model.items.first?.kind == .video, "the clip matched, the photo was outside the album")
+
+        await fixture.model.select(.allPhotos)
+        fixture.model.updateSearch("kyoto")
+        try await fixture.waitUntil {
+            fixture.model.isSearching && fixture.model.items.count == 1
+                && fixture.model.items.allSatisfy { $0.kind == .image }
+        }
+        #expect(fixture.model.items.first?.kind == .image)
+    }
 }
