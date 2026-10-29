@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Vision
 import GalleryCatalog
 import GalleryDomain
@@ -181,9 +182,18 @@ public actor AnalysisWorker {
                         return .failed(job, "The catalog cannot find this file.")
                     }
                     let root = target.scopedRoot ?? target.url
+                    // A clip's duration is an AVFoundation load, not a Vision call: read it before the lane so
+                    // the blocking work inside stays purely analysis.
+                    let isVideo = job.kind == .video
+                    let duration = isVideo
+                        ? try? await AVURLAsset(url: target.url).load(.duration)
+                        : nil
                     let work = await lane.run {
                         SecurityScope.withAccess(to: root) {
-                            analyzer.analyzeImage(at: target.url, subtype: job.subtype)
+                            if isVideo, let duration {
+                                return analyzer.analyzeVideo(at: target.url, duration: duration)
+                            }
+                            return analyzer.analyzeImage(at: target.url, subtype: job.subtype)
                         }
                     }
                     switch work {
@@ -194,8 +204,9 @@ public actor AnalysisWorker {
                             return .failed(job, "The file could not be decoded.")
                         }
                         // The person a face belongs to is not Vision's answer; the index assigns it, serially,
-                        // before the row is written so a face is never stored without its cluster.
-                        if !still.faces.isEmpty {
+                        // before the row is written so a face is never stored without its cluster. Clips have
+                        // no per-frame pixels to print, so their faces are counted but never clustered.
+                        if !isVideo, !still.faces.isEmpty {
                             still.faces = await faceIndex.assign(still.faces, mediaID: job.mediaID)
                         }
                         return .analyzed(job, still)
@@ -237,7 +248,8 @@ public actor AnalysisWorker {
                     ),
                     tags: tags,
                     dhash: still.dhash,
-                    faces: still.faces
+                    faces: still.faces,
+                    frameCount: still.frames
                 ))
                 if still.ocrText != nil { outcome.textFound += 1 }
                 if !tags.isEmpty { outcome.tagged += 1 }

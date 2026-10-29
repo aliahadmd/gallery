@@ -1,4 +1,6 @@
+import AVFoundation
 import CoreGraphics
+import CoreMedia
 import CoreText
 import Foundation
 import ImageIO
@@ -39,6 +41,62 @@ private func textImage(_ lines: [String], width: Int = 900, height: Int = 400) t
     ))
     CGImageDestinationAddImage(destination, image, nil)
     #expect(CGImageDestinationFinalize(destination))
+    return url
+}
+
+/// A two-second H.264 clip with one line of text burned into every frame, or a blank one when `text` is empty.
+private func titleClip(_ text: String, seconds: Int = 2) throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("analysis-\(UUID().uuidString).mov")
+    let width = 640
+    let height = 360
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+    let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+        AVVideoCodecKey: AVVideoCodecType.h264,
+        AVVideoWidthKey: width,
+        AVVideoHeightKey: height,
+    ])
+    input.expectsMediaDataInRealTime = false
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height,
+    ])
+    writer.add(input)
+    #expect(writer.startWriting())
+    writer.startSession(atSourceTime: .zero)
+    let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 92, nil)
+    for frame in 0..<(10 * seconds) {
+        while !input.isReadyForMoreMediaData { usleep(2_000) }
+        var buffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &buffer)
+        let pixelBuffer = try #require(buffer)
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        if let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(pixelBuffer), width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        ) {
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            if !text.isEmpty {
+                let attributed = NSAttributedString(string: text, attributes: [
+                    kCTFontAttributeName as NSAttributedString.Key: font,
+                    kCTForegroundColorAttributeName as NSAttributedString.Key: CGColor(gray: 0, alpha: 1),
+                ])
+                context.textPosition = CGPoint(x: 40, y: 130)
+                CTLineDraw(CTLineCreateWithAttributedString(attributed), context)
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        adaptor.append(pixelBuffer, withPresentationTime: CMTime(value: Int64(frame), timescale: 10))
+    }
+    input.markAsFinished()
+    let done = DispatchSemaphore(value: 0)
+    writer.finishWriting { done.signal() }
+    done.wait()
+    #expect(writer.status == .completed)
     return url
 }
 
@@ -93,5 +151,28 @@ struct VisionAnalyzerTests {
 
         let still = try #require(VisionAnalyzer().analyzeImage(at: url, subtype: []))
         #expect(still.ocrText == nil)
+    }
+
+    @Test("A clip with a title card is read at a sampled cadence, and a blank one invents nothing")
+    func videoAnalysis() async throws {
+        let titled = try titleClip("ZEBRA CROSSING")
+        let blank = try titleClip("")
+        defer {
+            try? FileManager.default.removeItem(at: titled)
+            try? FileManager.default.removeItem(at: blank)
+        }
+        let analyzer = VisionAnalyzer()
+
+        let read = try #require(analyzer.analyzeVideo(
+            at: titled, duration: try await AVURLAsset(url: titled).load(.duration)
+        ))
+        #expect(read.ocrText?.contains("ZEBRA") == true)
+        #expect(read.frames >= 2, "a two-second clip is sampled, not watched")
+        #expect(read.dhash == nil, "a clip has no single picture to hash")
+
+        let silent = try #require(analyzer.analyzeVideo(
+            at: blank, duration: try await AVURLAsset(url: blank).load(.duration)
+        ))
+        #expect(silent.ocrText == nil)
     }
 }

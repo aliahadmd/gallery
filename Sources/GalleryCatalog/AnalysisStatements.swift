@@ -42,13 +42,14 @@ enum AnalysisStatements {
     /// Newest first. Nothing on screen waits for analysis, and the files a user just imported are the ones
     /// they are most likely to look at; the partial index gives this order for free.
     ///
-    /// Images only until the video path lands: an AVFoundation clip has no ImageIO frame, and claiming it now
-    /// would park it as unreadable before it was ever given a chance.
+    /// Images and clips, minus Live Photo companions: the companion is the moving half of a picture that is
+    /// already analysed, and treating it separately would double every Live Photo.
     static let claim = """
     UPDATE media SET analysis_stage = 1, analysis_attempts = analysis_attempts + 1
     WHERE id IN (
       SELECT id FROM media
-      WHERE analysis_stage = 0 AND stage = 3 AND trash = 0 AND kind = ?
+      WHERE analysis_stage = 0 AND stage = 3 AND trash = 0
+        AND (kind = ? OR (kind = ? AND (subtype & ?) = 0))
       ORDER BY cap_day DESC, id DESC
       LIMIT ?
     )
@@ -67,7 +68,9 @@ enum AnalysisStatements {
       COALESCE(SUM(CASE WHEN analysis_stage < 2 THEN 1 ELSE 0 END), 0) AS pending,
       COALESCE(SUM(CASE WHEN analysis_stage = 3 THEN 1 ELSE 0 END), 0) AS parked
     FROM media
-    WHERE stage = 3 AND trash = 0 AND kind = ? AND (? IS NULL OR src_id = ?)
+    WHERE stage = 3 AND trash = 0
+      AND (kind = ? OR (kind = ? AND (subtype & ?) = 0))
+      AND (? IS NULL OR src_id = ?)
     """
 
     /// `aesthetic` and `is_utility` are on `media` because the sort and the cover queries read them as plain
@@ -249,9 +252,12 @@ extension Catalog {
     /// released by `releaseClaims` or reset by `beginSession` on the next launch.
     public func claimAnalysis(limit: Int) throws -> [AnalysisJob] {
         try handle.write {
-            try handle.query(AnalysisStatements.claim,
-                             [.integer(Int64(MediaKind.image.rawValue)), .integer(Int64(limit))])
-                .map(CatalogRow.analysisJob)
+            try handle.query(AnalysisStatements.claim, [
+                .integer(Int64(MediaKind.image.rawValue)),
+                .integer(Int64(MediaKind.video.rawValue)),
+                .integer(Int64(MediaSubtype.livePhotoCompanion.rawValue)),
+                .integer(Int64(limit)),
+            ]).map(CatalogRow.analysisJob)
         }
     }
 
@@ -334,8 +340,12 @@ extension Catalog {
 
     public func analysisCounts(sourceID: SourceID? = nil) throws -> AnalysisCounts {
         let id = sourceID.map { Value.integer($0.rawValue) } ?? .null
-        guard let row = try handle.firstRow(AnalysisStatements.counts,
-                                            [.integer(Int64(MediaKind.image.rawValue)), id, id]) else {
+        guard let row = try handle.firstRow(AnalysisStatements.counts, [
+            .integer(Int64(MediaKind.image.rawValue)),
+            .integer(Int64(MediaKind.video.rawValue)),
+            .integer(Int64(MediaSubtype.livePhotoCompanion.rawValue)),
+            id, id,
+        ]) else {
             return AnalysisCounts()
         }
         return AnalysisCounts(

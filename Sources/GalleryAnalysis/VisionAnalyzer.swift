@@ -1,4 +1,5 @@
 import Foundation
+import CoreMedia
 import Vision
 import GalleryDomain
 import GalleryImaging
@@ -51,9 +52,12 @@ public struct VisionAnalyzer: Sendable {
         public var ocrAccurate: Bool
         public var aesthetic: Double
         public var isUtility: Bool
-        public var dhash: UInt64
+        /// Nil for video: a clip has no single picture to compare for duplicates.
+        public var dhash: UInt64?
         /// Boxes and embeddings; the cluster id is filled in by the face index, which is not Vision's job.
         public var faces: [DetectedFace]
+        /// Frames sampled, 0 for a still.
+        public var frames: Int
     }
 
     private let configuration: Configuration
@@ -130,7 +134,8 @@ public struct VisionAnalyzer: Sendable {
             aesthetic: aesthetic,
             isUtility: modelSaysUtility,
             dhash: DHash.hash(frame),
-            faces: faces
+            faces: faces,
+            frames: 0
         )
     }
 
@@ -201,8 +206,51 @@ public struct VisionAnalyzer: Sendable {
         return values
     }
 
-    private func textRequest(level: VNRequestTextRecognitionLevel) -> VNRecognizeTextRequest {
-        let request = VNRecognizeTextRequest()
+    /// A clip, sampled rather than watched.
+    ///
+    /// `VNVideoProcessor` decodes once and hands frames to the requests on a cadence, which is the only way to
+    /// look at a video without reading it frame by frame into memory. Classification runs at 1 fps, text every
+    /// six seconds, faces every three; a talking head produces one face row, not ninety.
+    public func analyzeVideo(at url: URL, duration: CMTime) -> Still? {
+        let seconds = duration.seconds
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        let collector = VideoCollector()
+        let processor = VNVideoProcessor(url: url)
+
+        let classify = VNClassifyImageRequest { request, error in
+            guard error == nil else { return }
+            collector.addFrame((request.results ?? []).compactMap { $0 as? VNClassificationObservation })
+        }
+        let text: VNRecognizeTextRequest = VNRecognizeTextRequest { request, error in
+            guard error == nil else { return }
+            collector.addText((request.results ?? []).compactMap { $0 as? VNRecognizedTextObservation })
+        }
+        text.recognitionLevel = .fast
+        text.usesLanguageCorrection = true
+        let faces = VNDetectFaceCaptureQualityRequest { request, error in
+            guard error == nil else { return }
+            collector.addFaces((request.results ?? []).compactMap { $0 as? VNFaceObservation })
+        }
+
+        let classifyOptions = VNVideoProcessor.RequestProcessingOptions()
+        classifyOptions.cadence = VNVideoProcessor.FrameRateCadence(1)
+        let textOptions = VNVideoProcessor.RequestProcessingOptions()
+        textOptions.cadence = VNVideoProcessor.TimeIntervalCadence(6)
+        let faceOptions = VNVideoProcessor.RequestProcessingOptions()
+        faceOptions.cadence = VNVideoProcessor.TimeIntervalCadence(3)
+
+        do {
+            try processor.addRequest(classify, processingOptions: classifyOptions)
+            try processor.addRequest(text, processingOptions: textOptions)
+            try processor.addRequest(faces, processingOptions: faceOptions)
+            try processor.analyze(CMTimeRange(start: .zero, duration: duration))
+        } catch {
+            return nil
+        }
+        return collector.still()
+    }
+
+    private func textRequest(level: VNRequestTextRecognitionLevel) -> VNRecognizeTextRequest {        let request = VNRecognizeTextRequest()
         request.recognitionLevel = level
         request.usesLanguageCorrection = true
         request.automaticallyDetectsLanguage = true
@@ -227,5 +275,101 @@ public struct VisionAnalyzer: Sendable {
             }
             return candidate.string
         }
+    }
+}
+
+/// Frames from a video arrive on Vision's own queues; this is the one place a clip's evidence accumulates.
+///
+/// Classification is counted rather than averaged: a label that only one frame saw is a flicker, not a scene.
+/// Faces are deduplicated by box overlap, so a person standing in shot for thirty frames is one row.
+private final class VideoCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frameCount = 0
+    private var labelTotals: [String: (sum: Double, count: Int)] = [:]
+    private var lines: [String] = []
+    private var faces: [DetectedFace] = []
+
+    func addFrame(_ observations: [VNClassificationObservation]) {
+        lock.withLock {
+            frameCount += 1
+            for observation in observations.prefix(5) where observation.confidence >= 0.3 {
+                var entry = labelTotals[observation.identifier] ?? (0, 0)
+                entry.sum += Double(observation.confidence)
+                entry.count += 1
+                labelTotals[observation.identifier] = entry
+            }
+        }
+    }
+
+    func addText(_ observations: [VNRecognizedTextObservation]) {
+        let strings = observations
+            .compactMap { $0.topCandidates(1).first }
+            .filter { $0.confidence >= 0.3 }
+            .map(\.string)
+        guard !strings.isEmpty else { return }
+        lock.withLock { lines.append(contentsOf: strings) }
+    }
+
+    func addFaces(_ observations: [VNFaceObservation]) {
+        guard !observations.isEmpty else { return }
+        lock.withLock {
+            for observation in observations {
+                let box = observation.boundingBox
+                let quality = Double(observation.faceCaptureQuality ?? 0)
+                if let index = faces.firstIndex(where: { Self.overlap($0, box) > 0.5 }) {
+                    if quality > faces[index].quality {
+                        faces[index] = Self.face(observation, quality: quality)
+                    }
+                } else {
+                    faces.append(Self.face(observation, quality: quality))
+                }
+            }
+        }
+    }
+
+    func still() -> VisionAnalyzer.Still {
+        lock.withLock {
+            let threshold = max(1, Int(Double(frameCount) * 0.2))
+            let labels = labelTotals
+                .filter { $0.value.count >= threshold || $0.value.sum / Double($0.value.count) >= 0.3 }
+                .sorted { lhs, rhs in
+                    lhs.value.count == rhs.value.count
+                        ? lhs.value.sum > rhs.value.sum
+                        : lhs.value.count > rhs.value.count
+                }
+                .prefix(8)
+                .map { SceneLabel(identifier: $0.key, confidence: $0.value.sum / Double($0.value.count)) }
+            var seen = Set<String>()
+            let unique = lines.filter { seen.insert($0).inserted }
+            return VisionAnalyzer.Still(
+                labels: Array(labels),
+                ocrText: AnalysisRules.normalizedOCR(unique, limit: 4096),
+                ocrBlocks: unique.count,
+                ocrAccurate: false,
+                aesthetic: 0,
+                isUtility: false,
+                dhash: nil,
+                faces: faces,
+                frames: frameCount
+            )
+        }
+    }
+
+    private static func face(_ observation: VNFaceObservation, quality: Double) -> DetectedFace {
+        let box = observation.boundingBox
+        // No embedding: the processor does not hand out per-frame pixels, and a face without a descriptor is
+        // a box and a count — it must not become a person on the People shelf.
+        return DetectedFace(x: Double(box.origin.x), y: Double(box.origin.y),
+                            width: Double(box.width), height: Double(box.height),
+                            confidence: Double(observation.confidence), quality: quality, embedding: [])
+    }
+
+    private static func overlap(_ face: DetectedFace, _ box: CGRect) -> Double {
+        let a = CGRect(x: face.x, y: face.y, width: face.width, height: face.height)
+        let intersection = a.intersection(box)
+        guard !intersection.isNull else { return 0 }
+        let area = intersection.width * intersection.height
+        let union = a.width * a.height + box.width * box.height - area
+        return union > 0 ? Double(area / union) : 0
     }
 }
