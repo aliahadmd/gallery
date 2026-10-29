@@ -18,6 +18,7 @@ public struct SidebarView: View {
         (.allPhotos, "All Photos", "photo"),
         (.allVideos, "Videos", "video"),
         (.favorites, "Favorites", "star"),
+        (.duplicates, "Duplicates", "rectangle.on.rectangle"),
         (.screenshots, "Screenshots", "camera.viewfinder"),
         (.raw, "RAW", "doc"),
         (.livePhotos, "Live Photos", "livephoto"),

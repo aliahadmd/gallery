@@ -88,6 +88,15 @@ public struct LibraryGridView: View {
                                 Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
                             }
                             .help("Open the selected photo (Return)")
+
+                            if model.selection == .duplicates {
+                                Button {
+                                    Task { await model.keepBestAndTrashRest(around: selected) }
+                                } label: {
+                                    Label("Keep Best", systemImage: "crown")
+                                }
+                                .help("Keep the best shot of this set and move the rest to Trash")
+                            }
                         }
                     }
                 }

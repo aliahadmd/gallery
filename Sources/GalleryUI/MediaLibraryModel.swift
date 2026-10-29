@@ -72,6 +72,8 @@ public final class MediaLibraryModel {
     public private(set) var tags: [Album] = []
     /// Face clusters with enough photos to be a person. Numbered until somebody names them.
     public private(set) var people: [Album] = []
+    /// The best shot of every duplicate set, loaded while the Duplicates album is open so a cell can say so.
+    public private(set) var duplicateBests: Set<MediaID> = []
     public private(set) var analysisProgress: [SourceID: IndexProgress] = [:]
     private var analysisFeed: Task<Void, Never>?
     /// One level of folder albums per source, keyed by the source they belong to.
@@ -209,6 +211,7 @@ public final class MediaLibraryModel {
         // whose first pages could already have posters.
         await passB.start()
         await analysis?.start()
+        try? await catalog.pruneDuplicateGroups()
         await purgeExpiredTrash()
 
         do {
@@ -256,6 +259,19 @@ public final class MediaLibraryModel {
         } catch {
             notices.append(Notice("That person could not be hidden.", detail: "\(error)"))
         }
+    }
+
+    /// The one action the Duplicates album offers: keep the set's best shot, move the rest to the trash the
+    /// user can restore from. Never automatic — the app proposes, the user disposes.
+    public func keepBestAndTrashRest(around item: MediaItem) async {
+        guard let set = try? await reader.duplicateSet(containing: item.id) else { return }
+        let duplicates = set.members.filter { $0 != set.best }
+        guard !duplicates.isEmpty else { return }
+        await moveToTrash(duplicates)
+    }
+
+    public func isDuplicateBest(_ item: MediaItem) -> Bool {
+        duplicateBests.contains(item.id)
     }
 
     /// Pause/resume the third pass. The worker publishes a snapshot when it changes, so the HUD follows
@@ -506,6 +522,13 @@ public final class MediaLibraryModel {
             items = page.items
             cursor = page.nextCursor
             hasMorePages = page.hasMore
+            // The Duplicates album badges the keeper of each set, so the set has to be read whenever that
+            // album is the one on screen — one query over a tiny table, not per cell.
+            if selection == .duplicates {
+                duplicateBests = Set((try? await reader.bestDuplicateIDs()) ?? [])
+            } else if !duplicateBests.isEmpty {
+                duplicateBests = []
+            }
             // A fresh page can be a different set of rows, and a cell that left the album is not on screen
             // just because SwiftUI kept its view alive. Without this the window keeps prefetching pictures
             // the user switched away from.

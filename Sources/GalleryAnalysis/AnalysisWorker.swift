@@ -24,6 +24,7 @@ public actor AnalysisWorker {
         public var gate: (@Sendable () async -> Bool)?
         public var analyzer: VisionAnalyzer.Configuration
         public var faces: FaceClusterer.Configuration
+        public var duplicates: DuplicateFinder.Configuration
         public var pausedPollInterval: Duration
 
         public init(batchRows: Int = 32, maximumAttempts: Int = 2,
@@ -32,6 +33,7 @@ public actor AnalysisWorker {
                     gate: (@Sendable () async -> Bool)? = nil,
                     analyzer: VisionAnalyzer.Configuration = .init(),
                     faces: FaceClusterer.Configuration = .init(),
+                    duplicates: DuplicateFinder.Configuration = .init(),
                     pausedPollInterval: Duration = .milliseconds(500)) {
             self.batchRows = max(1, batchRows)
             self.maximumAttempts = max(1, maximumAttempts)
@@ -39,6 +41,7 @@ public actor AnalysisWorker {
             self.gate = gate
             self.analyzer = analyzer
             self.faces = faces
+            self.duplicates = duplicates
             self.pausedPollInterval = pausedPollInterval
         }
     }
@@ -50,6 +53,7 @@ public actor AnalysisWorker {
         public var textFound = 0
         public var tagged = 0
         public var facesFound = 0
+        public var duplicatesLinked = 0
         public var failed = 0
         public var parked = 0
         public var droppedBatches = 0
@@ -65,6 +69,7 @@ public actor AnalysisWorker {
     private let resolver: any MediaResolving
     private let analyzer: VisionAnalyzer
     private let faceIndex: FaceIndex
+    private let duplicateFinder: DuplicateFinder
     private let configuration: Configuration
 
     private var task: Task<Void, Never>?
@@ -83,6 +88,7 @@ public actor AnalysisWorker {
             revision: Int64(VNGenerateImageFeaturePrintRequest.currentRevision),
             clusterer: FaceClusterer(configuration: configuration.faces)
         )
+        self.duplicateFinder = DuplicateFinder(configuration: configuration.duplicates)
         self.configuration = configuration
     }
 
@@ -259,7 +265,44 @@ public actor AnalysisWorker {
         outcome.failed += failed.count
         outcome.parked += parked.count
 
+        // Grouping runs after the rows land: the candidate query reads `media_analysis`, and a photo cannot
+        // be compared against an analysis that has not been written yet.
+        await linkDuplicates(results, jobs: jobs, into: &outcome)
+
         for sourceID in Set(jobs.map(\.sourceID)) { await publishSnapshot(sourceID) }
+    }
+
+    /// Pairs each analysed photo with the first candidate it resembles, joining that candidate's group or
+    /// starting one. Local and incremental on purpose: a full recompute of duplicates at 100k is quadratic.
+    private func linkDuplicates(_ results: [MediaAnalysisResult], jobs: [AnalysisJob],
+                                into outcome: inout Outcome) async {
+        let hashes = results.filter { $0.dhash != nil }
+        guard !hashes.isEmpty else { return }
+        let byID = Dictionary(uniqueKeysWithValues: jobs.map { ($0.mediaID, $0) })
+        let days = Set(jobs.map(\.dayBucket)).filter { $0 > 0 }
+        let candidates = (try? await catalog.duplicateCandidates(
+            days: days, excluding: jobs.map(\.mediaID), limit: 2_000
+        )) ?? []
+        guard !candidates.isEmpty else { return }
+
+        let finder = duplicateFinder
+        for result in hashes {
+            guard let job = byID[result.mediaID], let hash = result.dhash else { continue }
+            let aspect = job.pixelHeight > 0 ? Double(job.pixelWidth) / Double(job.pixelHeight) : 0
+            let parent = (job.relativePath as NSString).deletingLastPathComponent
+            let probe = DuplicateFinder.Probe(
+                dhash: hash,
+                aspectRatio: aspect,
+                parentDirectory: parent == "." ? "" : parent,
+                captureUTC: job.captureUTC
+            )
+            guard let match = finder.match(probe, among: candidates) else { continue }
+            let groupID = (try? await catalog.duplicateGroupID(for: match.candidate.mediaID))
+                ?? Int64(fnv1aID("dup:\(min(result.mediaID.rawValue, match.candidate.mediaID.rawValue))"))
+            try? await catalog.addToDuplicateGroup(groupID: groupID, mediaID: result.mediaID,
+                                                   distance: match.distance)
+            outcome.duplicatesLinked += 1
+        }
     }
 
     /// Bumped when the shape of a result changes (a new tag vocabulary, a new request). A change is offered

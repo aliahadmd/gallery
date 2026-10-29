@@ -7,7 +7,8 @@ import GallerySQLite
 @Suite("Analysis schema and search")
 struct AnalysisTests {
     private func analysis(_ id: MediaID, ocr: String? = nil, tags: [String] = [],
-                          aesthetic: Double = 0, dhash: UInt64? = nil) -> MediaAnalysisResult {
+                          aesthetic: Double = 0, dhash: UInt64? = nil,
+                          utility: Bool = false) -> MediaAnalysisResult {
         MediaAnalysisResult(
             mediaID: id,
             statHash: 1,
@@ -16,6 +17,7 @@ struct AnalysisTests {
             ocrText: ocr,
             ocrBlockCount: ocr == nil ? 0 : 1,
             aesthetic: aesthetic,
+            isUtility: utility,
             tags: tags,
             dhash: dhash
         )
@@ -171,5 +173,41 @@ struct AnalysisTests {
         counts = try await fixture.catalog.analysisCounts(sourceID: source.id)
         #expect(counts.done == 1 && counts.pending == 0 && counts.parked == 1)
         #expect(try await fixture.catalog.claimAnalysis(limit: 10).isEmpty)
+    }
+
+    @Test("A duplicate set keeps the best shot, never a utility one, and dies below two members")
+    func duplicateGroups() async throws {
+        let fixture = try await CatalogFixture()
+        defer { fixture.tearDown() }
+        let source = try await fixture.addSource()
+        let ids = try await fixture.record((0..<3).map {
+            makeItem("IMG_\($0).JPG", documentID: Int64($0 + 1), sourceID: source.id)
+        })
+        let stored = try await fixture.reader.items(ids: ids)
+        try await fixture.metadata(stored.map { $0.decoded() })
+        try await fixture.catalog.recordAnalysis([
+            analysis(ids[0], aesthetic: 0.2, dhash: 0xFF00),
+            analysis(ids[1], aesthetic: 0.9, dhash: 0xFF01),
+            analysis(ids[2], aesthetic: 0.95, dhash: 0xFF03, utility: true),
+        ])
+
+        for id in ids {
+            try await fixture.catalog.addToDuplicateGroup(groupID: 4242, mediaID: id, distance: 1)
+        }
+
+        let set = try #require(try await fixture.reader.duplicateSet(containing: ids[0]))
+        #expect(set.best == ids[1], "the highest score wins, and a utility shot is never the keeper")
+        #expect(Set(set.members) == Set(ids))
+        #expect(try await fixture.reader.bestDuplicateIDs() == [ids[1]])
+
+        let day = try #require(try await fixture.reader.item(id: ids[0])).dayBucket
+        let candidates = try await fixture.catalog.duplicateCandidates(days: [day], excluding: [ids[0]])
+        #expect(candidates.count == 2, "same-day rows with a hash, minus the one being analysed")
+
+        // Two of the three leave: the set is no longer a set.
+        try await fixture.catalog.deleteMedia(ids: [ids[1], ids[2]])
+        try await fixture.catalog.pruneDuplicateGroups()
+        #expect(try await fixture.catalog.duplicateGroupID(for: ids[0]) == nil)
+        #expect(try await fixture.reader.bestDuplicateIDs().isEmpty)
     }
 }

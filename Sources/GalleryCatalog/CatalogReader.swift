@@ -136,7 +136,8 @@ public actor CatalogReader {
                    (SELECT id FROM media AS inner_media
                      WHERE inner_media.src_id = media.src_id AND inner_media.parent_rel = media.parent_rel
                        AND inner_media.trash = 0 AND inner_media.stage = 3
-                     ORDER BY inner_media.cap_utc DESC, inner_media.id DESC LIMIT 1) AS cover_id
+                     ORDER BY inner_media.aesthetic DESC, inner_media.cap_utc DESC, inner_media.id DESC
+                     LIMIT 1) AS cover_id
             FROM media
             WHERE media.src_id = ? AND media.trash = 0 AND media.parent_rel <> ''
             GROUP BY media.parent_rel
@@ -238,6 +239,26 @@ public actor CatalogReader {
                 sortKey: -Int64(try row.int64(named: "face_count"))
             )
         }
+    }
+
+    /// The best shot of every duplicate set — what the grid badges while the Duplicates album is open.
+    public func bestDuplicateIDs() throws -> [MediaID] {
+        try handle.query(AnalysisStatements.duplicateBests).map { row in
+            MediaID(rawValue: try row.int64(named: "best_id"))
+        }
+    }
+
+    /// The set a photo belongs to, with the member the app would keep. Nil when the photo is not a duplicate.
+    public func duplicateSet(containing mediaID: MediaID) throws -> (best: MediaID, members: [MediaID])? {
+        guard let group = try handle
+            .firstValue(AnalysisStatements.duplicateGroupOf, [.integer(mediaID.rawValue)])?
+            .int64OrZero, group != 0 else { return nil }
+        guard let best = try handle
+            .firstValue("SELECT best_id FROM duplicate_group WHERE id = ?", [.integer(group)])?
+            .int64OrZero, best != 0 else { return nil }
+        let members = try handle.query(AnalysisStatements.membersOfDuplicateGroup, [.integer(group)])
+            .map { MediaID(rawValue: try $0.int64(named: "media_id")) }
+        return (MediaID(rawValue: best), members)
     }
 
     // MARK: - Search

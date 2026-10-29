@@ -151,6 +151,20 @@ enum CatalogRow {
         )
     }
 
+    static func duplicateCandidate(_ row: Row) throws -> DuplicateCandidate {
+        DuplicateCandidate(
+            mediaID: MediaID(rawValue: try row.int64(named: "id")),
+            dhash: UInt64(bitPattern: try row.int64(named: "dhash")),
+            dayBucket: Int32(truncatingIfNeeded: try row.int64(named: "cap_day")),
+            parentDirectory: try row.string(named: "parent_rel"),
+            captureUTC: try row.double(named: "cap_utc"),
+            pixelWidth: Int32(truncatingIfNeeded: try row.optionalInt64(named: "px_w") ?? 0),
+            pixelHeight: Int32(truncatingIfNeeded: try row.optionalInt64(named: "px_h") ?? 0),
+            aesthetic: try row.double(named: "aesthetic"),
+            isUtility: try row.bool(named: "is_utility")
+        )
+    }
+
     static func analysisJob(_ row: Row) throws -> AnalysisJob {
         AnalysisJob(
             mediaID: MediaID(rawValue: try row.int64(named: "id")),
@@ -160,6 +174,9 @@ enum CatalogRow {
             relativePath: try row.string(named: "rel_path"),
             modificationDate: try row.optionalInt64(named: "mtime_ns").map(Date.init(nanoseconds:)),
             dayBucket: Int32(truncatingIfNeeded: try row.int64(named: "cap_day")),
+            captureUTC: try row.double(named: "cap_utc"),
+            pixelWidth: Int32(truncatingIfNeeded: try row.optionalInt64(named: "px_w") ?? 0),
+            pixelHeight: Int32(truncatingIfNeeded: try row.optionalInt64(named: "px_h") ?? 0),
             statHash: try row.int64(named: "stat_hash").statHashValue,
             attempts: Int(try row.int64(named: "analysis_attempts"))
         )

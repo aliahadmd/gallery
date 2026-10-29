@@ -114,6 +114,11 @@ public struct MediaCellView: View {
             if item.isFavorite {
                 Image(systemName: "star.fill").foregroundStyle(.yellow)
             }
+            if model.isDuplicateBest(item) {
+                Image(systemName: "crown.fill")
+                    .foregroundStyle(.yellow)
+                    .help("The best shot in this duplicate set")
+            }
             if item.subtype.contains(.raw) {
                 Text("RAW")
                     .font(.system(size: 8, weight: .bold))

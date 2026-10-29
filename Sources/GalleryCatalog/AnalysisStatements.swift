@@ -11,6 +11,9 @@ public struct AnalysisJob: Sendable, Hashable {
     public var relativePath: String
     public var modificationDate: Date?
     public var dayBucket: Int32
+    public var captureUTC: Double
+    public var pixelWidth: Int32
+    public var pixelHeight: Int32
     /// The file's stamp at claim time: what the analysis row records so a changed file can tell "same bytes"
     /// from "re-walked".
     public var statHash: UInt64
@@ -49,7 +52,8 @@ enum AnalysisStatements {
       ORDER BY cap_day DESC, id DESC
       LIMIT ?
     )
-    RETURNING id, src_id, kind, subtype, rel_path, mtime_ns, cap_day, stat_hash, analysis_attempts
+    RETURNING id, src_id, kind, subtype, rel_path, mtime_ns, cap_day, cap_utc, px_w, px_h, stat_hash,
+              analysis_attempts
     """
 
     static let releaseClaims = "UPDATE media SET analysis_stage = 0 WHERE id IN (%@)"
@@ -151,6 +155,53 @@ enum AnalysisStatements {
     static let updateCluster = """
     UPDATE face_cluster SET centroid = ?, face_count = ? WHERE id = ?
     """
+
+    // MARK: - Duplicates
+
+    static let duplicateGroupOf = "SELECT group_id FROM duplicate_member WHERE media_id = ?"
+
+    static let insertDuplicateGroup = """
+    INSERT OR IGNORE INTO duplicate_group (id, member_count, created_ns, updated_ns) VALUES (?, 0, ?, ?)
+    """
+
+    static let insertDuplicateMember = """
+    INSERT OR IGNORE INTO duplicate_member (group_id, media_id, distance) VALUES (?, ?, ?)
+    """
+
+    /// Count and best are recomputed in the same transaction as the insert, so the album and the "best"
+    /// badge can never disagree about a group. A utility shot (a receipt, a screenshot) is never the best.
+    static let refreshDuplicateGroup = """
+    UPDATE duplicate_group SET
+      member_count = (SELECT COUNT(*) FROM duplicate_member WHERE group_id = ?),
+      best_id = (SELECT member.media_id
+                 FROM duplicate_member AS member JOIN media ON media.id = member.media_id
+                 WHERE member.group_id = ?
+                 ORDER BY (media.is_utility = 1), media.aesthetic DESC,
+                          (COALESCE(media.px_w, 0) * COALESCE(media.px_h, 0)) DESC, media.id DESC
+                 LIMIT 1),
+      updated_ns = ?
+    WHERE id = ?
+    """
+
+    static let pruneDuplicateGroups = """
+    UPDATE duplicate_group SET member_count = (
+      SELECT COUNT(*) FROM duplicate_member WHERE group_id = duplicate_group.id
+    );
+    DELETE FROM duplicate_group WHERE member_count < 2;
+    """
+
+    static let duplicateBests = "SELECT best_id FROM duplicate_group WHERE best_id IS NOT NULL"
+
+    static let membersOfDuplicateGroup = """
+    SELECT media_id FROM duplicate_member WHERE group_id = ?
+    """
+
+    static let duplicateCandidates = """
+    SELECT m.id, a.dhash, m.cap_day, m.parent_rel, m.cap_utc, m.px_w, m.px_h, m.aesthetic, m.is_utility
+    FROM media AS m JOIN media_analysis AS a ON a.media_id = m.id
+    WHERE m.cap_day IN (%@) AND m.trash = 0 AND a.dhash IS NOT NULL %@
+    ORDER BY m.cap_day DESC, m.id DESC LIMIT ?
+    """
 }
 
 /// One stored person, as the index loads it.
@@ -160,6 +211,37 @@ public struct FaceClusterRow: Sendable, Hashable {
     public var centroid: [Float]
     public var dims: Int
     public var faceCount: Int
+}
+
+/// A photo that could be the same picture as the one being analysed.
+public struct DuplicateCandidate: Sendable, Hashable {
+    public var mediaID: MediaID
+    public var dhash: UInt64
+    public var dayBucket: Int32
+    public var parentDirectory: String
+    public var captureUTC: Double
+    public var pixelWidth: Int32
+    public var pixelHeight: Int32
+    public var aesthetic: Double
+    public var isUtility: Bool
+
+    public init(mediaID: MediaID, dhash: UInt64, dayBucket: Int32, parentDirectory: String,
+                captureUTC: Double, pixelWidth: Int32, pixelHeight: Int32, aesthetic: Double,
+                isUtility: Bool) {
+        self.mediaID = mediaID
+        self.dhash = dhash
+        self.dayBucket = dayBucket
+        self.parentDirectory = parentDirectory
+        self.captureUTC = captureUTC
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.aesthetic = aesthetic
+        self.isUtility = isUtility
+    }
+
+    public var aspectRatio: Double {
+        pixelHeight > 0 ? Double(pixelWidth) / Double(pixelHeight) : 0
+    }
 }
 
 extension Catalog {
@@ -350,5 +432,48 @@ extension Catalog {
             withUnsafeBytes(of: value.bitPattern.littleEndian) { data.append(contentsOf: $0) }
         }
         return .blob([UInt8](data))
+    }
+
+    // MARK: - Duplicates
+
+    /// Candidates are the same days as the batch, not the whole library: a global Hamming scan is ten billion
+    /// comparisons, and two photographs of the same thing are almost always taken on the same day.
+    public func duplicateCandidates(days: Set<Int32>, excluding: [MediaID],
+                                    limit: Int = 2_000) throws -> [DuplicateCandidate] {
+        guard !days.isEmpty else { return [] }
+        let dayList = Array(days).sorted()
+        let dayPlaceholders = Array(repeating: "?", count: dayList.count).joined(separator: ", ")
+        let exclusion = excluding.isEmpty
+            ? ""
+            : "AND m.id NOT IN (\(Array(repeating: "?", count: excluding.count).joined(separator: ", ")))"
+        let sql = String(format: AnalysisStatements.duplicateCandidates, dayPlaceholders, exclusion)
+        var arguments: [Value] = dayList.map { .integer(Int64($0)) }
+        arguments.append(contentsOf: excluding.map { .integer($0.rawValue) })
+        arguments.append(.integer(Int64(limit)))
+        return try handle.query(sql, arguments).map(CatalogRow.duplicateCandidate)
+    }
+
+    public func duplicateGroupID(for mediaID: MediaID) throws -> Int64? {
+        (try handle.firstValue(AnalysisStatements.duplicateGroupOf, [.integer(mediaID.rawValue)])?
+            .int64OrZero).flatMap { $0 == 0 ? nil : $0 }
+    }
+
+    /// Join (or start) a group. Count and best are recomputed here so the album and the badge cannot drift.
+    public func addToDuplicateGroup(groupID: Int64, mediaID: MediaID, distance: Int) throws {
+        let now = Date().nanoseconds
+        try handle.write {
+            try handle.exec(AnalysisStatements.insertDuplicateGroup,
+                            [.integer(groupID), .integer(now), .integer(now)])
+            try handle.exec(AnalysisStatements.insertDuplicateMember,
+                            [.integer(groupID), .integer(mediaID.rawValue), .integer(Int64(distance))])
+            try handle.exec(AnalysisStatements.refreshDuplicateGroup,
+                            [.integer(groupID), .integer(groupID), .integer(now), .integer(groupID)])
+        }
+    }
+
+    /// Called at launch: a group whose members were trashed has a stale count, and a group with one member
+    /// left is not a duplicate set.
+    public func pruneDuplicateGroups() throws {
+        try handle.write { try handle.exec(AnalysisStatements.pruneDuplicateGroups) }
     }
 }
