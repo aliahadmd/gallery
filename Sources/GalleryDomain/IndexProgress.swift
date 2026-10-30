@@ -10,6 +10,8 @@ public enum IndexPhase: String, Sendable, Hashable, Codable, CaseIterable {
     case thumbnailing
     /// The third pass: on-device analysis (tags, text, faces). Runs after the drain, never during it.
     case analyzing
+    /// The cheap pass that turns stored signals into Smart-album categories. Runs after analysis.
+    case categorizing
     case watching
     case finished
     case failed
@@ -56,7 +58,8 @@ public struct IndexProgress: Sendable, Hashable, Codable {
     /// is really still decoding.
     public var isListingComplete: Bool {
         switch phase {
-        case .sweeping, .readingMetadata, .deriving, .thumbnailing, .analyzing, .watching, .finished: true
+        case .sweeping, .readingMetadata, .deriving, .thumbnailing, .analyzing, .categorizing,
+             .watching, .finished: true
         case .resolving, .enumerating, .failed: false
         }
     }

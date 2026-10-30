@@ -79,28 +79,54 @@ public struct RootView: View {
         } message: { action in
             Text(action.message)
         }
-        .sheet(isPresented: Binding(
-            get: { model.isShowingBatchFailures },
-            set: { if !$0 { model.dismissBatchFailures() } }
-        )) {
-            BatchFailureSheet(failures: model.lastBatchFailures) { model.dismissBatchFailures() }
-        }
-        .sheet(isPresented: Binding(
-            get: { model.renameSession != nil },
-            set: { if !$0 { model.closeRename() } }
-        )) {
-            if let session = model.renameSession {
-                RenameSheet(model: model, session: session)
+        // One sheet slot, not three. SwiftUI presents at most one sheet per view, so three independent
+        // booleans can silently drop the second request; a priority order queues it instead.
+        .sheet(item: sheetBinding) { sheet in
+            switch sheet {
+            case .batchFailures:
+                BatchFailureSheet(failures: model.lastBatchFailures) { model.dismissBatchFailures() }
+            case .rename:
+                if let session = model.renameSession {
+                    RenameSheet(model: model, session: session)
+                }
+            case .batchMetadata:
+                if let session = model.batchMetadataSession {
+                    BatchMetadataSheet(model: model, session: session)
+                }
             }
         }
-        .sheet(isPresented: Binding(
-            get: { model.batchMetadataSession != nil },
-            set: { if !$0 { model.closeBatchMetadata() } }
-        )) {
-            if let session = model.batchMetadataSession {
-                BatchMetadataSheet(model: model, session: session)
+    }
+
+    private enum Sheet: String, Identifiable {
+        case batchFailures
+        case rename
+        case batchMetadata
+        var id: String { rawValue }
+    }
+
+    /// The one sheet that should be visible right now. Batch failures win because they follow an action the
+    /// user just confirmed; the other two are deliberate, single-purpose panels.
+    private func visibleSheet() -> Sheet? {
+        if model.isShowingBatchFailures { return .batchFailures }
+        if model.renameSession != nil { return .rename }
+        if model.batchMetadataSession != nil { return .batchMetadata }
+        return nil
+    }
+
+    private var sheetBinding: Binding<Sheet?> {
+        Binding(
+            get: { visibleSheet() },
+            set: { value in
+                guard value == nil else { return }
+                // Closing the visible sheet must not also cancel a different panel that is waiting behind it.
+                switch visibleSheet() {
+                case .batchFailures: model.dismissBatchFailures()
+                case .rename: model.closeRename()
+                case .batchMetadata: model.closeBatchMetadata()
+                case nil: break
+                }
             }
-        }
+        )
     }
 
     /// The split view owns the window's chrome, so the welcome screen cannot be one of its columns — and an

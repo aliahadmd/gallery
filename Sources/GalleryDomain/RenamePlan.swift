@@ -50,6 +50,13 @@ public enum RenamePlanBuilder {
             unchanged: 0, companionCount: 0, overLimit: false, subjectCount: subjects.count
         )
         guard !subjects.isEmpty else { return plan }
+        if let destination = rule.destinationFolder,
+           let problem = RenameRule.destinationProblem(destination) {
+            for subject in subjects {
+                plan.skipped[subject.mediaID] = .invalidDestination(problem.message)
+            }
+            return plan
+        }
         guard subjects.count <= maximumSubjects else {
             plan.overLimit = true
             return plan
@@ -189,7 +196,7 @@ public enum RenamePlanBuilder {
 
     private static func validate(name: String) -> RenameIssue? {
         if name.isEmpty { return .empty }
-        if name.lengthOfBytes(using: .utf8) > 250 {
+        if name.lengthOfBytes(using: .utf8) > Limits.filenameBytes {
             return .tooLong(bytes: name.lengthOfBytes(using: .utf8))
         }
         if name.hasPrefix(".") { return .leadingDot }

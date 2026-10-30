@@ -20,8 +20,9 @@ public actor CategoryWorker {
         public var isLowPower: @Sendable () -> Bool
 
         public init(
-            batchRows: Int = 128, maximumAttempts: Int = 2, sampleSide: Int32 = 96,
-            samplesPerHop: Int = 32,
+            batchRows: Int = 128, maximumAttempts: Int = 2,
+            sampleSide: Int32 = Limits.categorySampleSide,
+            samplesPerHop: Int = Limits.categorySamplesPerHop,
             gate: (@Sendable () async -> Bool)? = nil,
             isLowPower: @escaping @Sendable () -> Bool = {
                 ProcessInfo.processInfo.isLowPowerModeEnabled
@@ -52,6 +53,9 @@ public actor CategoryWorker {
 
     public var isRunning: Bool { running }
 
+    /// Whether the pass is holding between hops. The UI reads this to draw the HUD's pause state.
+    public var isPaused: Bool { paused }
+
     public func cancel() {
         cancelled = true
     }
@@ -64,11 +68,16 @@ public actor CategoryWorker {
     public func runOnce() async -> Int {
         guard !running else { return 0 }
         running = true
+        // A cancel is meant to stop this pass, not to retire the worker: the next scan or analysis finish
+        // starts a fresh pass in the same session.
+        cancelled = false
         defer { running = false }
         try? await catalog.resetStaleCategoryClaims()
 
         var classified = 0
-        while !cancelled {
+        // Both stops count: the explicit cancel flag (another session or a menu action) and cancellation of
+        // the task that called us (the window closing).
+        while !cancelled && !Task.isCancelled {
             if paused || configuration.isLowPower() {
                 try? await Task.sleep(for: .seconds(2))
                 continue
@@ -104,6 +113,9 @@ public actor CategoryWorker {
                 try await catalog.recordCategories(results)
                 classified += results.count
             } catch {
+                // Put this hop's rows back before leaving: a write failure is not evidence that the rows
+                // were classified, and leaving them claimed would hide them until the next relaunch.
+                try? await catalog.releaseCategoryClaims(results.map(\.mediaID))
                 Log.analysis.error("categories: could not write a \(results.count)-row batch: \(error)")
                 break
             }
@@ -125,7 +137,8 @@ public actor CategoryWorker {
         return CategoryInput(
             name: job.name, fileExtension: job.fileExtension, typeIdentifier: job.typeIdentifier,
             subtype: job.subtype, pixelSize: job.pixelSize, device: job.device,
-            hasGPS: job.hasGPS, hasCaptureDate: job.hasCaptureDate, labels: labels,
+            hasGPS: job.hasGPS, hasCaptureDate: job.hasCaptureDate,
+            captureSource: job.captureSource, labels: labels,
             ocrChars: job.ocrChars, ocrBlocks: job.ocrBlocks, ocrAccurate: job.ocrAccurate,
             aesthetic: job.aesthetic, isUtility: job.isUtility, faceCount: job.faceCount,
             sampled: sampled

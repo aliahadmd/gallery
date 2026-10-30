@@ -232,3 +232,19 @@ private func makeDate(_ y: Int, _ m: Int, _ d: Int) -> Date {
     #expect(plan.preview.first?.toName == "x-a.jpg")
     #expect(plan.preview.contains { $0.issue != nil })
 }
+
+@Test func aDestinationTheWalkerSkipsIsRefusedBeforeAFileMoves() {
+    #expect(RenameRule.destinationProblem("../outside") == .parentTraversal)
+    #expect(RenameRule.destinationProblem("/absolute") == .absolute)
+    #expect(RenameRule.destinationProblem(".hidden") == .hiddenComponent(".hidden"))
+    #expect(RenameRule.destinationProblem("node_modules") == .reservedComponent("node_modules"))
+    #expect(RenameRule.destinationProblem("Holiday/2026") == nil)
+    #expect(RenameRule.destinationProblem("") == nil)
+
+    let plan = RenamePlanBuilder.plan(
+        RenameRule(destinationFolder: "../outside"),
+        subjects: [subject("a.jpg", id: 1)], existingNames: [:], timeZone: utc
+    )
+    #expect(plan.moves.isEmpty)
+    #expect(plan.skipped[MediaID(rawValue: 1)]?.message.contains("climb") == true)
+}

@@ -526,6 +526,30 @@ final class Fixture {
         #expect(lease.player.currentItem == nil, "the clip that left the screen was torn down")
     }
 
+    @Test("Opening and stepping the viewer keeps a multi-row selection")
+    func viewerKeepsMultiSelection() async throws {
+        let fixture = try await Fixture(files: 5)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        let items = fixture.model.items
+        fixture.model.select(items[0].id)
+        fixture.model.select(items[1].id, extending: true)
+        #expect(fixture.model.selectedCount == 2)
+
+        fixture.model.openViewer(items[0].id)
+        #expect(fixture.model.selectedCount == 2, "opening a selected photo does not collapse the selection")
+
+        await fixture.model.stepViewer(by: 1)
+        #expect(fixture.model.viewerItem?.id == items[1].id)
+        #expect(fixture.model.selectedCount == 2, "stepping the viewer does not collapse the selection")
+        #expect(fixture.model.selectedID == items[1].id, "the inspector follows the viewer")
+
+        fixture.model.closeViewer()
+        #expect(fixture.model.selectedCount == 2)
+    }
+
     @Test("Capture dates become day albums once the drain has read them")
     func dayAlbumsAppearAfterDrain() async throws {
         let fixture = try await Fixture(files: 0)

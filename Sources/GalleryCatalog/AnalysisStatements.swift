@@ -75,8 +75,12 @@ enum AnalysisStatements {
 
     /// `aesthetic` and `is_utility` are on `media` because the sort and the cover queries read them as plain
     /// columns; the tags and the recognised text are the two FTS sources.
+    /// New analysis results invalidate the category verdict built on the old ones. The stage goes back to
+    /// zero even on a re-analysis, because labels, OCR and faces are exactly the evidence the classifier
+    /// consumes; leaving `category_stage = 2` would keep the shelf showing a decision nothing supports.
     static let finishRow = """
-    UPDATE media SET analysis_stage = 2, aesthetic = ?, is_utility = ?, search_tags = ?, search_ocr = ?
+    UPDATE media SET analysis_stage = 2, aesthetic = ?, is_utility = ?, search_tags = ?, search_ocr = ?,
+                     category = 0, category_confidence = 0, category_stage = 0, category_attempts = 0
     WHERE id = ?
     """
 

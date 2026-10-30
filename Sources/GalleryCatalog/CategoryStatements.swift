@@ -15,6 +15,8 @@ public struct CategoryJob: Sendable {
     public var device: String?
     public var hasGPS: Bool
     public var hasCaptureDate: Bool
+    /// Where the capture date came from. A filesystem date is not camera evidence; an EXIF date is.
+    public var captureSource: CaptureSource?
     public var aesthetic: Double
     public var isUtility: Bool
     public var labelsJSON: String?
@@ -27,7 +29,8 @@ public struct CategoryJob: Sendable {
     public init(
         mediaID: MediaID, sourceID: SourceID, statHash: UInt64, subtype: MediaSubtype,
         name: String, fileExtension: String, typeIdentifier: String, pixelSize: PixelSize?,
-        device: String?, hasGPS: Bool, hasCaptureDate: Bool, aesthetic: Double, isUtility: Bool,
+        device: String?, hasGPS: Bool, hasCaptureDate: Bool, captureSource: CaptureSource?,
+        aesthetic: Double, isUtility: Bool,
         labelsJSON: String?, ocrChars: Int, ocrBlocks: Int, ocrAccurate: Bool, faceCount: Int,
         dhash: Int64?
     ) {
@@ -42,6 +45,7 @@ public struct CategoryJob: Sendable {
         self.device = device
         self.hasGPS = hasGPS
         self.hasCaptureDate = hasCaptureDate
+        self.captureSource = captureSource
         self.aesthetic = aesthetic
         self.isUtility = isUtility
         self.labelsJSON = labelsJSON
@@ -78,10 +82,10 @@ extension Catalog {
                 WHERE id IN (
                   SELECT id FROM media
                   WHERE category_stage = 0 AND analysis_stage = 2 AND stage = 3 AND trash = 0
-                    AND kind = 0 AND analysis_attempts < ?
+                    AND kind = 0 AND category_attempts < ?
                   ORDER BY cap_day DESC, id DESC LIMIT ?)
                 RETURNING id, src_id, stat_hash, subtype, name, ext, uttype, px_w, px_h, device,
-                          has_gps, cap_utc, aesthetic, is_utility
+                          has_gps, cap_utc, cap_src, aesthetic, is_utility
                 """,
                 [.integer(Int64(maximumAttempts + 1)), .integer(Int64(limit))]
             )
@@ -125,6 +129,7 @@ extension Catalog {
                     device: try row.optionalString(named: "device"),
                     hasGPS: try row.bool(named: "has_gps"),
                     hasCaptureDate: try row.double(named: "cap_utc") != 0,
+                    captureSource: CaptureSource(rawValue: Int16(truncatingIfNeeded: try row.int64(named: "cap_src"))),
                     aesthetic: try row.double(named: "aesthetic"),
                     isUtility: try row.bool(named: "is_utility"),
                     labelsJSON: detail?.0,
@@ -186,6 +191,24 @@ extension Catalog {
     /// A crash can leave rows claimed; at start they go back into the queue.
     public func resetStaleCategoryClaims() throws {
         try handle.exec("UPDATE media SET category_stage = 0 WHERE category_stage = 1")
+    }
+
+    /// A failed write must not strand the rows it claimed until the next launch. Releasing only this hop's
+    /// ids leaves any other claim alone and makes the next pass retry them (until the attempt limit).
+    public func releaseCategoryClaims(_ ids: [MediaID]) throws {
+        guard !ids.isEmpty else { return }
+        try handle.write {
+            var index = 0
+            while index < ids.count {
+                let chunk = ids[index..<min(index + 500, ids.count)]
+                let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
+                try handle.exec(
+                    "UPDATE media SET category_stage = 0 WHERE category_stage = 1 AND id IN (\(placeholders))",
+                    chunk.map { .integer($0.rawValue) }
+                )
+                index += chunk.count
+            }
+        }
     }
 
     /// Re-runs the classifier everywhere without re-running Vision. Feedback survives.

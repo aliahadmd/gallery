@@ -81,6 +81,27 @@ import GallerySupport
     #expect(try await fixture.reader.search("kyoto").isEmpty)
 }
 
+@Test func sidecarsFollowTheirPhotoAndUndo() async throws {
+    let fixture = try await RenameFixture(names: ["IMG_1.jpg"])
+    defer { fixture.tearDown() }
+    let sidecar = fixture.root.appendingPathComponent("IMG_1.aae")
+    try Data("adjustments".utf8).write(to: sidecar)
+
+    let plan = try await fixture.plan(RenameRule(find: "IMG_", replace: "Kyoto-"))
+    let outcome = await fixture.service.execute(plan)
+    #expect(outcome.moved.count == 1, "\(outcome.failed)")
+    let renamed = fixture.root.appendingPathComponent("Kyoto-1.aae")
+    #expect(FileManager.default.fileExists(atPath: renamed.path), "the adjustment follows the photo")
+    #expect(!FileManager.default.fileExists(atPath: sidecar.path))
+
+    let undo = try #require(outcome.undo)
+    #expect(undo.sidecars.count == 1)
+    let undone = await fixture.service.undo(undo)
+    #expect(undone.moved.count == 1, "\(undone.failed)")
+    #expect(FileManager.default.fileExists(atPath: sidecar.path))
+    #expect(!FileManager.default.fileExists(atPath: renamed.path), "undo puts the sidecar back too")
+}
+
 @Test func aDestinationThatAppearedAfterPlanningIsRefused() async throws {
     let fixture = try await RenameFixture(names: ["a.jpg"])
     defer { fixture.tearDown() }

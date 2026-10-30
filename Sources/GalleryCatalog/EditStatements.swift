@@ -90,21 +90,27 @@ extension Catalog {
         }
     }
 
+    /// A category is a verdict about the file as it was. Every edit — pixels or metadata — invalidates it,
+    /// because capture date, GPS and device are classifier inputs; the pixels case additionally has to drop
+    /// the derived rows entirely.
     private static let pixelEditNoProjectionSQL = """
     UPDATE media SET stat_hash = ?, size_bytes = ?, mtime_ns = ?, ctime_ns = ?,
-                     stage = 1, err_code = 0
+                     stage = 1, err_code = 0,
+                     category = 0, category_confidence = 0, category_stage = 0, category_attempts = 0
     WHERE id = ? AND stat_hash = ?
     """
 
     private static let metadataEditNoProjectionSQL = """
     UPDATE media SET stat_hash = ?, size_bytes = ?, mtime_ns = ?, ctime_ns = ?,
-                     stage = MAX(stage, 3), err_code = 0
+                     stage = MAX(stage, 3), err_code = 0,
+                     category = 0, category_confidence = 0, category_stage = 0, category_attempts = 0
     WHERE id = ? AND stat_hash = ?
     """
 
     private static let pixelEditSQL = """
     UPDATE media SET stat_hash = ?, size_bytes = ?, mtime_ns = ?, ctime_ns = ?,
                      stage = 1, err_code = 0,
+                     category = 0, category_confidence = 0, category_stage = 0, category_attempts = 0,
                      title = ?, cap_utc = ?, cap_wall = ?, cap_day = ?, cap_month = ?, cap_tz = ?,
                      cap_src = ?, lat = ?, lon = ?, has_gps = ?, place_key = NULL, cluster_id = NULL
     WHERE id = ? AND stat_hash = ?
@@ -113,6 +119,7 @@ extension Catalog {
     private static let metadataEditSQL = """
     UPDATE media SET stat_hash = ?, size_bytes = ?, mtime_ns = ?, ctime_ns = ?,
                      stage = MAX(stage, 3), err_code = 0,
+                     category = 0, category_confidence = 0, category_stage = 0, category_attempts = 0,
                      title = ?, cap_utc = ?, cap_wall = ?, cap_day = ?, cap_month = ?, cap_tz = ?,
                      cap_src = ?, lat = ?, lon = ?, has_gps = ?, place_key = NULL, cluster_id = NULL
     WHERE id = ? AND stat_hash = ?

@@ -20,6 +20,9 @@ public struct LibraryGridView: View {
     @State private var marqueeCurrent: CGPoint?
 
     public var body: some View {
+        // Read once per body: `selectedIDs` walks every loaded row, and calling it from each cell turns a
+        // 20,000-row page into a quadratic scan on every selection change.
+        let selectedIDs = model.selectedIDs
         VStack(spacing: 0) {
             if model.selectedCount > 0 {
                 SelectionBar(model: model)
@@ -51,7 +54,7 @@ public struct LibraryGridView: View {
                     ForEach(model.daySections) { section in
                         Section {
                             LazyVGrid(columns: Self.columns, spacing: 3) {
-                                ForEach(section.items) { item in cell(item) }
+                                ForEach(section.items) { item in cell(item, selected: selectedIDs) }
                             }
                         } header: {
                             DayHeader(title: section.title, count: section.items.count)
@@ -62,7 +65,7 @@ public struct LibraryGridView: View {
                 .padding(3)
             } else {
                 LazyVGrid(columns: Self.columns, spacing: 3) {
-                    ForEach(model.items) { item in cell(item) }
+                    ForEach(model.items) { item in cell(item, selected: selectedIDs) }
                     loadMoreTrigger
                 }
                 .padding(3)
@@ -212,6 +215,13 @@ public struct LibraryGridView: View {
                         ? { Task { await model.cancelScan(progress.sourceID) } } : nil
                 )
                 .padding(12)
+            } else if let progress = model.categoryProgress {
+                IndexProgressHUD(
+                    progress: progress,
+                    onPause: { Task { await model.setCategoryPaused(!progress.isPaused) } },
+                    onCancel: nil
+                )
+                .padding(12)
             }
         }
     }
@@ -254,8 +264,8 @@ public struct LibraryGridView: View {
         }
     }
 
-    @ViewBuilder private func cell(_ item: MediaItem) -> some View {
-        MediaCellView(item: item, model: model, isSelected: model.selectedIDs.contains(item.id))
+    @ViewBuilder private func cell(_ item: MediaItem, selected: Set<MediaID>) -> some View {
+        MediaCellView(item: item, model: model, isSelected: selected.contains(item.id))
     }
 
     /// One clear pixel at the end of the grid is what turns "the user reached the bottom" into a page
@@ -280,7 +290,11 @@ public struct LibraryGridView: View {
 
     private var subtitle: String {
         if model.isLoadingPage { return "Loading…" }
-        return model.rowCount.formatted() + (model.rowCount == 1 ? " item" : " items")
+        var text = model.rowCount.formatted() + (model.rowCount == 1 ? " item" : " items")
+        if model.isSearchCapped {
+            text += " · first \(Limits.searchHits) matches"
+        }
+        return text
     }
 
     @ViewBuilder private var sortMenu: some View {

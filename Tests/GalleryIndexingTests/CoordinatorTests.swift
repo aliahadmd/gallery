@@ -219,6 +219,21 @@ struct CoordinatorTests {
         #expect(sources.isEmpty, "refusing the pick must also not leave a source behind")
     }
 
+    @Test("A file URL is refused: opening a photo with Gallery must not register the photo as a library")
+    func refusesFile() async throws {
+        let library = try await CoordinatorFixture()
+        defer { library.tearDown() }
+        let tree = try FixtureTree()
+        defer { tree.cleanup() }
+        let file = try tree.file("IMG_1.jpg")
+
+        await #expect(throws: IndexingError.self) {
+            _ = try await library.coordinator.addFolder(file, scanning: false)
+        }
+        let sources = try await library.catalog.sources()
+        #expect(sources.isEmpty)
+    }
+
     @Test("A folder that no longer exists comes back needing a pick, not missing")
     func resolveAfterFolderDeleted() async throws {
         let library = try await CoordinatorFixture()

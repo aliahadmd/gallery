@@ -158,11 +158,21 @@ public struct MediaCellView: View {
                 }
             }
             Button("Delete Forever", role: .destructive) {
-                if multi { model.requestDeleteForever() } else { Task { await model.deleteForever([item.id]) } }
+                if multi {
+                    model.requestDeleteForever()
+                } else {
+                    model.select(item.id)
+                    model.requestDeleteForever()
+                }
             }
         } else {
             Button(multi ? "Move \(model.selectedCount) Items to Trash" : "Move to Trash", role: .destructive) {
-                if multi { model.requestTrash() } else { Task { await model.moveToTrash([item.id]) } }
+                if multi {
+                    model.requestTrash()
+                } else {
+                    model.select(item.id)
+                    model.requestTrash()
+                }
             }
         }
     }

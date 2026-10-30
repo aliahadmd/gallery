@@ -66,12 +66,57 @@ public actor EditService {
 
     /// Writes the fields into the file, in place, then commits the projection to the catalog. The file's
     /// mtime is restored because the pixels did not change: the poster and the analysis stay valid.
+    ///
+    /// The write truncates and rewrites in place, which is the only way to keep the inode (and with it the
+    /// favorites, Finder tags and capture date). That leaves a crash window; a copy in the backup ledger
+    /// before the first byte is written is what makes it recoverable, and it also gives metadata edits the
+    /// same Revert affordance Replace Original has.
     public func applyMetadata(_ overrides: MetadataOverrides, to item: MediaItem) async -> MetadataOutcome {
         guard !overrides.isEmpty else { return MetadataOutcome(written: true) }
         guard let target = await resolver.targets(for: [item.id])[item.id] else {
             return MetadataOutcome(written: false, message: "The file could not be found.")
         }
         let scope = target.scopedRoot ?? target.url.deletingLastPathComponent()
+        guard let original = try? FileStat.read(target.url) else {
+            return MetadataOutcome(written: false, message: "The file could not be read.")
+        }
+
+        let relative = backupPath(for: item)
+        let backupURL = trashRoot.appendingPathComponent(relative)
+        let ledgerID: Int64
+        do {
+            try FileManager.default.createDirectory(
+                at: backupURL.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            ledgerID = try await catalog.beginBackup(TrashLedgerEntry(
+                mediaID: item.id, sourceID: item.sourceID, fromRelativePath: item.relativePath,
+                fromVolumeID: item.identity.volumeID, mode: .editBackup, byteSize: original.size
+            ))
+            let copied = await metadataLane.run { () -> Bool in
+                SecurityScope.begin(scope)
+                defer { SecurityScope.end(scope) }
+                do {
+                    try FileManager.default.copyItem(at: target.url, to: backupURL)
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            guard case .completed(true) = copied,
+                  let backup = try? FileStat.read(backupURL), backup.size == original.size else {
+                try? FileManager.default.removeItem(at: backupURL)
+                try? await catalog.failBackup(ledgerID: ledgerID, error: "the backup was incomplete")
+                return MetadataOutcome(
+                    written: false,
+                    message: "The backup could not be written; the original was not changed."
+                )
+            }
+            try await catalog.recordBackupDestination(ledgerID: ledgerID, path: relative)
+        } catch {
+            try? FileManager.default.removeItem(at: backupURL)
+            return MetadataOutcome(written: false, message: "The backup could not be written: \(error)")
+        }
+
         let prepared = await metadataLane.run { () -> MetadataStep in
             SecurityScope.begin(scope)
             defer { SecurityScope.end(scope) }
@@ -101,6 +146,9 @@ public actor EditService {
         }
         let projection = EditProjection(title: values.title, capture: capture, gps: values.gps)
         do {
+            // The file is on disk in its new form; the ledger records what a revert would need even if the
+            // catalog commit below loses its CAS.
+            try await catalog.completeBackup(ledgerID: ledgerID, resultStatHash: stat.statHash)
             let committed = try await catalog.commitEdit(MediaEditCommit(
                 mediaID: item.id,
                 expectedStatHash: item.identity.statHash,
@@ -111,7 +159,7 @@ public actor EditService {
             guard committed else {
                 return MetadataOutcome(
                     written: false,
-                    message: "The file changed while it was being edited. Try again."
+                    message: "The file changed while it was being edited. Revert restores the backup."
                 )
             }
             return MetadataOutcome(
@@ -167,6 +215,7 @@ public actor EditService {
         let staging = target.url.deletingLastPathComponent()
             .appendingPathComponent(".gallery-replace-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: staging) }
+        Self.sweepStaleTemps(in: target.url.deletingLastPathComponent())
         let source = EditSource(
             mediaID: item.id, url: target.url, scopedRoot: target.scopedRoot, kind: item.kind,
             name: item.name, modificationDate: item.modificationDate, captureDate: item.capture?.instant
@@ -327,6 +376,27 @@ public actor EditService {
         "versions/\(item.sourceID.rawValue)/\(UUID().uuidString)/\(item.relativePath)"
     }
 
+    /// A crash between truncate and the final chunk leaves a `.gallery-meta-*` temp behind. It names no
+    /// original, so it cannot be restored — but the backup ledger covers recovery; this only stops the
+    /// debris accumulating in the user's folders. The age floor keeps a write that is still running (another
+    /// instance, a slow network volume) out of reach.
+    private static func sweepStaleTemps(in directory: URL) {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .isRegularFileKey]
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: Array(keys)
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-86_400)
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard name.hasPrefix(".gallery-meta-") || name.hasPrefix(".gallery-replace-") else { continue }
+            guard let values = try? entry.resourceValues(forKeys: keys),
+                  values.isRegularFile == true,
+                  let modified = values.contentModificationDate,
+                  modified < cutoff else { continue }
+            try? FileManager.default.removeItem(at: entry)
+        }
+    }
+
     private enum MetadataStep: Sendable {
         case prepared(MetadataValues, FileStat, reencoded: Bool)
         case failed(String)
@@ -338,6 +408,7 @@ public actor EditService {
         }
         let existing = MetadataEditor.readBack(url) ?? .none
         let values = MetadataValues.resolve(overrides, existing: existing)
+        sweepStaleTemps(in: url.deletingLastPathComponent())
         let temp = url.deletingLastPathComponent()
             .appendingPathComponent(".gallery-meta-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: temp) }

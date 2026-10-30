@@ -11,12 +11,15 @@ public enum IndexingError: Error, Sendable, Hashable, CustomStringConvertible {
     case volumeUnavailable(path: String)
     /// The folder resolves but the system refuses to list it — the grant behind the bookmark no longer holds.
     case folderUnreadable(path: String)
+    /// A URL that is not a directory. Opening a photo with Gallery used to land here; a file is not a library.
+    case notAFolder(path: String)
 
     public var description: String {
         switch self {
         case .recycledFolder(let path): "“\(path)” is the Trash. Gallery does not index it."
         case .volumeUnavailable(let path): "The volume holding “\(path)” is not readable."
         case .folderUnreadable(let path): "Gallery lost access to “\(path)”. Pick the folder again to restore it."
+        case .notAFolder(let path): "“\(path)” is a file, not a folder. Add the folder that contains it."
         }
     }
 }
@@ -128,6 +131,11 @@ public actor IndexCoordinator {
     public func addFolder(_ url: URL, displayName: String? = nil, scanning: Bool = true) async throws -> FolderSource {
         let root = url.standardizedFileURL
         guard !Self.isRecycledFolder(root) else { throw IndexingError.recycledFolder(path: root.path) }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw IndexingError.notAFolder(path: root.path)
+        }
         guard let volumeID = VolumeIdentity.identifier(for: root) else {
             throw IndexingError.volumeUnavailable(path: root.path)
         }

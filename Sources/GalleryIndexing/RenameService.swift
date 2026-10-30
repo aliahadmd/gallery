@@ -20,11 +20,28 @@ public actor RenameService {
 
     public struct Undo: Sendable {
         public var moves: [RenameMove]
+        /// Sidecars that were moved alongside their media. They are not catalog rows, so they are not part of
+        /// `moves`; without this a rename could not be undone without orphaning adjustments.
+        public var sidecars: [SidecarMove]
         public var createdAt: Date
 
-        public init(moves: [RenameMove], createdAt: Date = Date()) {
+        public init(moves: [RenameMove], sidecars: [SidecarMove] = [], createdAt: Date = Date()) {
             self.moves = moves
+            self.sidecars = sidecars
             self.createdAt = createdAt
+        }
+    }
+
+    /// A same-stem sidecar (Photos adjustments, Lightroom XMP) that follows its photo.
+    public struct SidecarMove: Sendable, Hashable {
+        public var mediaID: MediaID
+        public var from: URL
+        public var to: URL
+
+        public init(mediaID: MediaID, from: URL, to: URL) {
+            self.mediaID = mediaID
+            self.from = from
+            self.to = to
         }
     }
 
@@ -60,7 +77,10 @@ public actor RenameService {
                 fromParent: move.toParent, toParent: move.fromParent
             )
         }
-        return await run(reversed, progress: progress)
+        let sidecars = undo.sidecars.map { sidecar in
+            SidecarMove(mediaID: sidecar.mediaID, from: sidecar.to, to: sidecar.from)
+        }
+        return await run(reversed, sidecars: sidecars, progress: progress)
     }
 
     /// Replays the journal at launch: a staged file goes back to its original name, and a journal row with
@@ -113,7 +133,8 @@ public actor RenameService {
     }
 
     private func run(
-        _ moves: [RenameMove], progress: @Sendable (Int, Int) -> Void
+        _ moves: [RenameMove], sidecars explicitSidecars: [SidecarMove]? = nil,
+        progress: @Sendable (Int, Int) -> Void
     ) async -> Outcome {
         var outcome = Outcome()
         guard !moves.isEmpty else { return outcome }
@@ -234,7 +255,34 @@ public actor RenameService {
             }
         }
 
-        // Phase 3 — catalog, one row at a time, so one contested path cannot roll back the rest. A chain
+        // Phase 3 — sidecars. They are not catalog rows, so a failure here is logged rather than reported
+        // as a failed rename: the photo is where the user asked, and losing an XMP adjustment is bad but
+        // pretending the photo did not move would be worse.
+        let movedMedia = Set(written.map { $0.0.item.id })
+        let sidecars = explicitSidecars ?? written.flatMap { operation, _ in
+            Self.sidecarMoves(for: operation)
+        }
+        var movedSidecars: [SidecarMove] = []
+        for sidecar in sidecars where movedMedia.contains(sidecar.mediaID) {
+            guard FileManager.default.fileExists(atPath: sidecar.from.path) else { continue }
+            if FileManager.default.fileExists(atPath: sidecar.to.path) {
+                Log.indexing.error(
+                    "sidecar: \(sidecar.to.lastPathComponent, privacy: .public) already exists; left behind"
+                )
+                continue
+            }
+            do {
+                selfWrites?.note()
+                try FileManager.default.moveItem(at: sidecar.from, to: sidecar.to)
+                movedSidecars.append(sidecar)
+            } catch {
+                Log.indexing.error(
+                    "sidecar: could not move \(sidecar.from.lastPathComponent, privacy: .public): \(error)"
+                )
+            }
+        }
+
+        // Phase 4 — catalog, one row at a time, so one contested path cannot roll back the rest. A chain
         // must be written dependents-first (3→4 before 2→3) or the unique path index refuses the middle.
         let orderedWrites = Self.catalogOrder(written)
         let records = orderedWrites.map { operation, stat in
@@ -256,10 +304,34 @@ public actor RenameService {
         let movedSet = Set(outcome.moved)
         let executed = written.map(\.0.move).filter { movedSet.contains($0.mediaID) }
         if !executed.isEmpty {
-            outcome.undo = Undo(moves: executed)
+            let kept = movedSidecars.filter { movedSet.contains($0.mediaID) }
+            outcome.undo = Undo(moves: executed, sidecars: kept)
         }
         return outcome
     }
+
+    /// The same-stem `.aae`/`.xmp` files beside a photo, with the names they must take next to it.
+    private static func sidecarMoves(for operation: Operation) -> [SidecarMove] {
+        let sourceDirectory = operation.fromURL.deletingLastPathComponent()
+        let destinationDirectory = operation.toURL.deletingLastPathComponent()
+        let oldStem = (operation.move.fromName as NSString).deletingPathExtension
+        let newStem = (operation.move.toName as NSString).deletingPathExtension
+        guard oldStem != newStem || sourceDirectory != destinationDirectory else { return [] }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: sourceDirectory.path)) ?? []
+        let foldedStem = fold(oldStem)
+        return names.compactMap { name in
+            let ext = (name as NSString).pathExtension
+            guard sidecarExtensions.contains(ext.lowercased()),
+                  fold((name as NSString).deletingPathExtension) == foldedStem else { return nil }
+            return SidecarMove(
+                mediaID: operation.item.id,
+                from: sourceDirectory.appendingPathComponent(name),
+                to: destinationDirectory.appendingPathComponent(newStem + "." + ext)
+            )
+        }
+    }
+
+    private static let sidecarExtensions: Set<String> = ["aae", "xmp"]
 
     private func rows(for ids: [MediaID]) async -> [MediaID: MediaItem] {
         var result: [MediaID: MediaItem] = [:]

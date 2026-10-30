@@ -105,6 +105,26 @@ import GalleryDomain
         fixture.model.closeViewer()
     }
 
+    @Test("Invert during a search stays inside the hits")
+    func invertDuringSearchStaysInsideTheHits() async throws {
+        let fixture = try await Fixture(files: 12)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        fixture.model.updateSearch("photo_1")
+        try await fixture.waitUntil { fixture.model.isSearching }
+        let hits = Set(fixture.model.items.map(\.id))
+        #expect(!hits.isEmpty)
+        let first = try #require(fixture.model.items.first)
+        fixture.model.select(first.id)
+        fixture.model.invertSelection()
+
+        #expect(fixture.model.selectedCount == hits.count - 1)
+        #expect(fixture.model.selectedIDs.isSubset(of: hits),
+                "an inversion cannot select rows outside the search")
+    }
+
     @Test("Typing a search starts a new selection scope")
     func searchResetsSelection() async throws {
         let fixture = try await Fixture(files: 30)
@@ -119,5 +139,45 @@ import GalleryDomain
         #expect(fixture.model.selectedCount == 0,
                 "a search is a different scope; the old album selection cannot leak into it")
         #expect(!fixture.model.isWholeAlbumSelection)
+    }
+
+    @Test("A whole-album batch follows the grid's sort, not row ids")
+    func wholeAlbumBatchFollowsGridSort() async throws {
+        let fixture = try await Fixture(files: 8)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        fixture.model.sort = MediaSort(field: .fileName, order: .descending)
+        await fixture.model.reload()
+        let visible = fixture.model.items.map(\.name)
+        #expect(visible == visible.sorted(by: >), "the grid is actually in the sort being tested")
+
+        fixture.model.selectAll()
+        let batch = try #require(fixture.model.batchSelection())
+        #expect(batch.isWholeAlbum)
+        let resolved = await fixture.model.resolveRows(batch)
+        #expect(resolved.rows.map(\.name) == visible,
+                "a rename sequence must number the rows in the order the user sees")
+    }
+
+    @Test("A batch keeps the selection's order, so a rename sequence numbers what the user sees")
+    func batchRowsKeepExplicitOrder() async throws {
+        let fixture = try await Fixture(files: 6)
+        defer { await fixture.tearDown() }
+        await fixture.model.add([fixture.media])
+        try await fixture.settle()
+
+        // Deliberately the reverse of rowid/grid order: a `WHERE id IN` comes back in table order, and a
+        // sequence built from that would number the photos backwards.
+        let reversed = fixture.model.items.map(\.id).reversed().map { $0 }
+        let batch = BatchSelection(album: .all, explicit: reversed, count: reversed.count)
+        let resolved = await fixture.model.resolveRows(batch)
+        #expect(resolved.rows.map(\.id) == reversed)
+        #expect(!resolved.isTruncated)
+
+        let capped = await fixture.model.resolveRows(batch, limit: 2)
+        #expect(capped.rows.map(\.id) == Array(reversed.prefix(2)))
+        #expect(capped.isTruncated, "an action that cannot cover the selection has to say so")
     }
 }

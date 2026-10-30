@@ -641,20 +641,23 @@ public actor Catalog {
     }
 
     /// The newest backup that has somewhere to restore from. Pending rows are included so a crash mid-write
-    /// still surfaces an undo rather than hiding it behind a completed flag that never landed.
+    /// still surfaces an undo rather than hiding it behind a completed flag that never landed. Rows whose
+    /// backup was already restored, lost or purged are excluded: offering one would promise bytes that are
+    /// gone, or worse, revert work the user already accepted.
     public func latestBackup(mediaID: MediaID) throws -> TrashLedgerEntry? {
         try handle.firstRow(
             """
-            SELECT * FROM trash_ledger WHERE media_id = ? AND mode = 2 AND to_rel IS NOT NULL
+            SELECT * FROM trash_ledger WHERE media_id = ? AND mode = 2 AND to_rel IS NOT NULL AND state = ?
             ORDER BY trashed_ns DESC, id DESC LIMIT 1
             """,
-            [.integer(mediaID.rawValue)]
+            [.integer(mediaID.rawValue), .integer(Int64(TrashState.backup.rawValue))]
         ).map(CatalogRow.trashEntry)
     }
 
     public func pendingBackups() throws -> [TrashLedgerEntry] {
         try handle.query(
-            "SELECT * FROM trash_ledger WHERE mode = 2 AND completed_ns IS NULL ORDER BY id"
+            "SELECT * FROM trash_ledger WHERE mode = 2 AND completed_ns IS NULL AND state = ? ORDER BY id",
+            [.integer(Int64(TrashState.backup.rawValue))]
         ).map(CatalogRow.trashEntry)
     }
 

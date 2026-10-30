@@ -69,6 +69,52 @@ public struct RenameRule: Sendable, Hashable, Codable {
         find.isEmpty && prefix.isEmpty && suffix.isEmpty && !usesCaptureDate
             && sequence == nil && destinationFolder == nil
     }
+
+    /// A destination the walker would never descend into is a destination whose files disappear on the next
+    /// scan. The panel normally supplies a child of the source, but the rule is also a value that can be
+    /// built by tests and by the Shortcuts surface, so it validates itself.
+    public enum DestinationProblem: Sendable, Hashable, Error {
+        case absolute
+        case parentTraversal
+        case hiddenComponent(String)
+        case reservedComponent(String)
+        case illegalComponent(String)
+
+        public var message: String {
+            switch self {
+            case .absolute: "The destination must be relative to the library folder."
+            case .parentTraversal: "The destination cannot climb out of the library folder."
+            case .hiddenComponent(let name): "Gallery skips “\(name)”: a folder whose name starts with a dot is hidden."
+            case .reservedComponent(let name): "Gallery skips “\(name)”: it is not a photo folder."
+            case .illegalComponent(let name): "“\(name)” cannot be a folder name here."
+            }
+        }
+    }
+
+    /// Components the walker excludes even though they are not hidden.
+    public static let reservedFolderNames: Set<String> = [
+        "node_modules", "__pycache__", "venv", "@eadir", "lost+found", "$recycle.bin",
+    ]
+
+    public static func destinationProblem(_ path: String) -> DestinationProblem? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") { return .absolute }
+        for raw in trimmed.split(separator: "/", omittingEmptySubsequences: false) {
+            let component = String(raw)
+            if component.isEmpty || component == "." { continue }
+            if component == ".." { return .parentTraversal }
+            if component.hasPrefix(".") { return .hiddenComponent(component) }
+            if component.hasSuffix(" ") || component.hasSuffix(".") || component.contains(":") {
+                return .illegalComponent(component)
+            }
+            if component.utf8.count > Limits.filenameBytes { return .illegalComponent(component) }
+            if reservedFolderNames.contains(component.lowercased()) {
+                return .reservedComponent(component)
+            }
+        }
+        return nil
+    }
 }
 
 /// One file the planner is allowed to touch. Everything the rule needs, without the catalog.
@@ -130,11 +176,12 @@ public enum RenameIssue: Sendable, Hashable, Error {
     case trashed
     case offline
     case missing
+    case invalidDestination(String)
 
     public var message: String {
         switch self {
         case .empty: "The new name is empty."
-        case .tooLong(let bytes): "The new name is \(bytes) bytes; the limit is 250."
+        case .tooLong(let bytes): "The new name is \(bytes) bytes; the limit is \(Limits.filenameBytes)."
         case .illegalCharacters: "The name contains /, : or a control character."
         case .leadingDot: "A name starting with a dot is hidden from the library."
         case .trailingCharacter: "A name cannot end with a space or a dot."
@@ -144,6 +191,7 @@ public enum RenameIssue: Sendable, Hashable, Error {
         case .trashed: "The file is in the Trash."
         case .offline: "The file is not downloaded."
         case .missing: "The file is no longer in the library."
+        case .invalidDestination(let reason): reason
         }
     }
 }

@@ -46,6 +46,16 @@ enum MediaStatements {
                             THEN 0 ELSE media.analysis_stage END,
       analysis_attempts = CASE WHEN media.stat_hash <> excluded.stat_hash
                                THEN 0 ELSE media.analysis_attempts END,
+      -- The category is a verdict about bytes that no longer exist. It goes back to unclassified rather
+      -- than waiting for the analysis pass to notice: a rescan alone must be able to drop a stale verdict.
+      category = CASE WHEN media.stat_hash <> excluded.stat_hash
+                      THEN 0 ELSE media.category END,
+      category_confidence = CASE WHEN media.stat_hash <> excluded.stat_hash
+                                 THEN 0 ELSE media.category_confidence END,
+      category_stage = CASE WHEN media.stat_hash <> excluded.stat_hash
+                            THEN 0 ELSE media.category_stage END,
+      category_attempts = CASE WHEN media.stat_hash <> excluded.stat_hash
+                               THEN 0 ELSE media.category_attempts END,
       -- Every SET expression sees the pre-update row, so this compares against the *old* hash: a file
       -- that really changed clears the error the previous attempt recorded, one that merely got
       -- re-walked keeps the error pass B gave it.

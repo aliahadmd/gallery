@@ -56,6 +56,10 @@ struct GalleryCommands: Commands {
             Button("Recategorize Smart Albums") {
                 Task { await model.recategorizeCategories() }
             }
+
+            Button("Export Category Audit…") {
+                model.exportCategoryAudit()
+            }
         }
 
         CommandMenu("Photo") {            Button("Open") {

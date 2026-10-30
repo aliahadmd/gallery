@@ -7,17 +7,49 @@ import GalleryImaging
 private func input(
     _ name: String, ext: String = "jpg", subtype: MediaSubtype = [],
     size: (Int32, Int32)? = nil, device: String? = nil, gps: Bool = false, captured: Bool = false,
+    captureSource: CaptureSource? = nil,
     labels: [(String, Double)] = [], ocrChars: Int = 0, blocks: Int = 0, accurate: Bool = false,
     aesthetic: Double = 0.5, utility: Bool = false, faces: Int = 0, sampled: SampledFeatures? = nil
 ) -> CategoryInput {
     CategoryInput(
         name: name, fileExtension: ext, subtype: subtype,
         pixelSize: size.map { PixelSize(width: $0.0, height: $0.1) },
-        device: device, hasGPS: gps, hasCaptureDate: captured,
+        device: device, hasGPS: gps, hasCaptureDate: captured, captureSource: captureSource,
         labels: labels.map { SceneLabel(identifier: $0.0, confidence: $0.1) },
         ocrChars: ocrChars, ocrBlocks: blocks, ocrAccurate: accurate,
         aesthetic: aesthetic, isUtility: utility, faceCount: faces, sampled: sampled
     )
+}
+
+@Test func aFilesystemDateIsNotCameraEvidence() {
+    // Pass B stamps a date on almost every file. A screen-sized image with a filesystem date must still
+    // read as "no camera", or the strongest screenshot signal quietly stops firing.
+    let evidence = CategoryClassifier.classify(input(
+        "Screenshot 2026-10-29 at 09.12.png", ext: "png", subtype: .screenshot,
+        size: (1170, 2532), captured: true, captureSource: .fileSystem,
+        labels: [("user interface", 0.8)]
+    ))
+    #expect(evidence.reasons.contains { $0.code == .noCameraMetadata })
+    #expect(!evidence.reasons.contains { $0.code == .cameraMetadata })
+
+    // An EXIF date is the camera's own statement, even when the device string is missing.
+    let photo = CategoryClassifier.classify(input(
+        "IMG_0001.jpg", size: (4032, 3024), captured: true,
+        captureSource: .exifDateTimeOriginal, labels: [("mountain", 0.9)], aesthetic: 0.7
+    ))
+    #expect(photo.reasons.contains { $0.code == .cameraMetadata })
+    #expect(!photo.reasons.contains { $0.code == .noCameraMetadata })
+}
+
+@Test func aTinyIconOutweighsAMediumGraphic() {
+    let evidence = CategoryClassifier.classify(input(
+        "icon.png", ext: "png", size: (64, 64), labels: [("logo", 0.8)],
+        sampled: SampledFeatures(
+            side: 96, hasAlpha: true, transparentRatio: 0.1, colorCount: 12,
+            flatRatio: 0.9, edgeRatio: 0.05
+        )
+    ))
+    #expect(evidence.reasons.contains { $0.code == .smallImage && $0.weight >= 20 })
 }
 
 @Test func anAppleScreenshotAtDeviceSizeIsAScreenshot() {

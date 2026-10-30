@@ -295,3 +295,28 @@ private func number(_ value: Any?) -> Double? {
     if let int = value as? Int { return Double(int) }
     return nil
 }
+
+@Test func aReadOnlyDestinationFailsCleanlyAndLeavesNoTemp() async throws {
+    let scratch = try ExportScratch()
+    let image = try #require(EditFixture.quadrantImage(width: 64, height: 48))
+    let sourceURL = scratch.file("a.jpg")
+    #expect(EditFixture.write(image, to: sourceURL))
+    let folder = try scratch.folder("locked")
+    chmod(folder.path, 0o555)
+    defer { chmod(folder.path, 0o755) }
+
+    let source = scratch.source("a.jpg")
+    var recipe = EditRecipe()
+    recipe.format = OutputFormat(kind: .jpeg)
+    let outcome = await Exporter().export(
+        [ExportRequest(source: source, recipe: recipe)],
+        to: folder,
+        policy: .init(),
+        progress: { _ in }
+    )
+    #expect(outcome.written.isEmpty)
+    #expect(outcome.failed[source.mediaID] == .destinationNotWritable
+            || outcome.failed[source.mediaID] == .encodeFailed,
+            "a read-only folder is a failure, not a success at an unexpected path")
+    #expect(scratch.contents(of: folder).isEmpty, "no temp file is left behind")
+}

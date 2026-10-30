@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.7.3</string>
+	<string>0.8.0</string>
 	<key>CFBundleVersion</key>
-	<string>11</string>
+	<string>12</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>LSMinimumSystemVersion</key>
@@ -45,7 +45,7 @@
 			<key>NSMessage</key>
 			<string>openFolder</string>
 			<key>NSPortName</key>
-			<string>Gallery</string>
+			<string>__APP_NAME__</string>
 			<key>NSSendFileTypes</key>
 			<array>
 				<string>public.folder</string>
@@ -54,26 +54,6 @@
 	</array>
 	<key>CFBundleDocumentTypes</key>
 	<array>
-		<dict>
-			<key>CFBundleTypeName</key>
-			<string>Image</string>
-			<key>CFBundleTypeRole</key>
-			<string>Viewer</string>
-			<key>LSItemContentTypes</key>
-			<array>
-				<string>public.image</string>
-			</array>
-		</dict>
-		<dict>
-			<key>CFBundleTypeName</key>
-			<string>Movie</string>
-			<key>LSItemContentTypes</key>
-			<array>
-				<string>public.movie</string>
-			</array>
-			<key>CFBundleTypeRole</key>
-			<string>Viewer</string>
-		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
 			<string>Folder</string>

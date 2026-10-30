@@ -20,6 +20,36 @@ import GallerySupport
             "a clock jump backwards must not silence the watcher")
 }
 
+@Test func metadataWriteKeepsTheInodeAndARestorableBackup() async throws {
+    let fixture = try await ReplaceFixture()
+    defer { fixture.tearDown() }
+    let before = try FileStat.read(fixture.url)
+    let originalBytes = try Data(contentsOf: fixture.url)
+
+    var overrides = MetadataOverrides()
+    overrides.title = .set("Harbour at dusk")
+    let outcome = await fixture.editor.applyMetadata(overrides, to: fixture.item)
+    #expect(outcome.written, "\(outcome.message ?? "")")
+
+    let after = try FileStat.read(fixture.url)
+    #expect(after.inode == before.inode, "a metadata edit writes through the descriptor")
+    #expect(try Data(contentsOf: fixture.url) != originalBytes)
+    #expect(MetadataEditor.readBack(fixture.url)?.title == "Harbour at dusk")
+
+    // The in-place write truncated the original; the ledger must hold the bytes it replaced.
+    let backup = try #require(try await fixture.catalog.latestBackup(mediaID: fixture.item.id))
+    #expect(backup.state == .backup)
+    #expect(backup.completedAt != nil)
+    let backupURL = try fixture.trashURL(relative: #require(backup.toRelativePath))
+    #expect(try Data(contentsOf: backupURL) == originalBytes)
+
+    // And it is a real undo, not just a file on disk.
+    let fresh = try #require(await fixture.reader.item(id: fixture.item.id))
+    let reverted = await fixture.editor.revertToPreviousVersion(fresh)
+    #expect(reverted.reverted, "\(reverted.message ?? "")")
+    #expect(try Data(contentsOf: fixture.url) == originalBytes)
+}
+
 @Test func replaceKeepsTheInodeAndLeavesARestorableBackup() async throws {
     let fixture = try await ReplaceFixture()
     defer { fixture.tearDown() }

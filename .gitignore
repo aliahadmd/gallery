@@ -13,3 +13,8 @@ xcuserdata/
 *.db
 *.db-wal
 *.db-shm
+
+# Release artifacts and generated icon sources. The zips are reproducible with Scripts/bundle-app.sh and
+# belong on the GitHub release, not in the tree.
+Gallery-*.zip
+vibe_images/

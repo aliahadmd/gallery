@@ -90,7 +90,9 @@ extension Catalog {
                         """
                         UPDATE media SET rel_path = ?, parent_rel = ?, name = ?, ext = ?, subtype = ?,
                                          search_text = ?, stat_hash = ?, size_bytes = ?, mtime_ns = ?,
-                                         ctime_ns = ?
+                                         ctime_ns = ?,
+                                         category = 0, category_confidence = 0, category_stage = 0,
+                                         category_attempts = 0
                         WHERE id = ? AND stat_hash = ?
                         """,
                         [.text(rename.toRelativePath), .text(rename.parentRelativePath), .text(rename.name),

@@ -1,4 +1,5 @@
 import Foundation
+import GalleryDomain
 
 /// Remembers that the app itself just wrote a file, so the folder watcher does not treat that write as a
 /// user edit and walk the whole folder two seconds later.
@@ -10,7 +11,7 @@ public final class SelfWriteGuard: @unchecked Sendable {
     private var lastWrite: Date?
     private let duration: TimeInterval
 
-    public init(duration: TimeInterval = 5) {
+    public init(duration: TimeInterval = Limits.selfWriteWindow) {
         self.duration = duration
     }
 

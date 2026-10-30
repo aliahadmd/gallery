@@ -51,6 +51,13 @@ struct IndexProgressHUD: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+            } else if progress.phase == .categorizing {
+                ProgressView(value: progress.analysisFraction)
+                    .progressViewStyle(.linear)
+                Text("\(progress.analyzed.formatted()) of \(progress.discovered.formatted()) classified")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
             } else {
                 ProgressView(value: progress.passBFraction)
                     .progressViewStyle(.linear)
@@ -84,6 +91,7 @@ extension IndexPhase {
         case .deriving: "Building albums…"
         case .thumbnailing: "Making previews…"
         case .analyzing: "Reading scenes and text…"
+        case .categorizing: "Recognising screenshots and documents…"
         case .watching: "Watching for changes"
         case .finished: "Up to date"
         case .failed: "Scan stopped"

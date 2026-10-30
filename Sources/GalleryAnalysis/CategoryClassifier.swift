@@ -12,6 +12,9 @@ public struct CategoryInput: Sendable {
     public var device: String?
     public var hasGPS: Bool
     public var hasCaptureDate: Bool
+    /// The source of the capture date: only EXIF counts as camera evidence. A filesystem date is assigned
+    /// to almost every file and would silently suppress the "no camera" signal.
+    public var captureSource: CaptureSource?
     public var labels: [SceneLabel]
     public var ocrChars: Int
     public var ocrBlocks: Int
@@ -24,7 +27,8 @@ public struct CategoryInput: Sendable {
     public init(
         name: String, fileExtension: String = "", typeIdentifier: String = "",
         subtype: MediaSubtype = [], pixelSize: PixelSize? = nil, device: String? = nil,
-        hasGPS: Bool = false, hasCaptureDate: Bool = false, labels: [SceneLabel] = [],
+        hasGPS: Bool = false, hasCaptureDate: Bool = false, captureSource: CaptureSource? = nil,
+        labels: [SceneLabel] = [],
         ocrChars: Int = 0, ocrBlocks: Int = 0, ocrAccurate: Bool = false,
         aesthetic: Double = 0, isUtility: Bool = false, faceCount: Int = 0,
         sampled: SampledFeatures? = nil
@@ -37,6 +41,7 @@ public struct CategoryInput: Sendable {
         self.device = device
         self.hasGPS = hasGPS
         self.hasCaptureDate = hasCaptureDate
+        self.captureSource = captureSource
         self.labels = labels
         self.ocrChars = ocrChars
         self.ocrBlocks = ocrBlocks
@@ -71,6 +76,10 @@ public enum CategoryClassifier {
 
     /// Common screenshot/display pixel sizes. Normalised to short×long at startup, so the literals may be
     /// written in either orientation and a portrait screenshot still matches.
+    ///
+    /// Maintenance: this table is closed on purpose — a heuristic cannot recognize a screen it has never
+    /// heard of — so add new display sizes here when Apple ships them. The device-aspect term is the
+    /// fallback for sizes that are not listed.
     private static let rawDeviceSizes = [
         "1170x2532", "1179x2556", "1284x2778", "1290x2796", "1320x2868",
         "1536x2048", "1640x2360", "1668x2388", "2048x2732", "2064x2752",
@@ -104,7 +113,11 @@ public enum CategoryClassifier {
         }
 
         let name = input.name.lowercased()
-        let noCamera = input.device == nil && !input.hasGPS && !input.hasCaptureDate
+        // Only metadata a camera wrote is evidence of a camera. Pass B fills a filesystem date for nearly
+        // every file, so consulting `hasCaptureDate` alone would make "no camera" almost never fire.
+        let cameraDate = input.captureSource?.isAuthoritative == true
+        let noCamera = input.device == nil && !input.hasGPS && !cameraDate
+        let cameraMetadata = input.device != nil || cameraDate
         let strongDocument = bestLabel(input.labels, matching: documentWords, atLeast: 0.6)
         let weakDocument = strongDocument == nil
             ? bestLabel(input.labels, matching: documentWords, atLeast: 0.4) : nil
@@ -156,7 +169,7 @@ public enum CategoryClassifier {
         if input.isUtility { add(.screenshot, .utilityFlag, 8) }
         if input.subtype.contains(.panorama) { add(.screenshot, .panorama, -15) }
         if input.faceCount > 0 { add(.screenshot, .faces, -25) }
-        if input.device != nil { add(.screenshot, .cameraMetadata, -20) }
+        if cameraMetadata { add(.screenshot, .cameraMetadata, -20) }
         if strongDocument != nil { add(.screenshot, .documentLabel, -15) }
 
         // Document.
@@ -187,14 +200,16 @@ public enum CategoryClassifier {
             add(.graphic, .flatColors, 15)
         }
         if palette <= 32 { add(.graphic, .smallPalette, 12) }
-        if small { add(.graphic, .smallImage, 15) } else if tiny { add(.graphic, .smallImage, 8) }
+        // A 128 px icon is stronger evidence than a 512 px graphic, so the weighting has to increase as the
+        // image shrinks rather than decrease.
+        if tiny { add(.graphic, .smallImage, 20) } else if small { add(.graphic, .smallImage, 12) }
         if square { add(.graphic, .square, 8) }
         if imageExtension { add(.graphic, .imageExtension, 12) }
         if noCamera { add(.graphic, .noCameraMetadata, 10) }
         if graphicLabel != nil { add(.graphic, .graphicLabel, 15, graphicLabel) }
         if input.faceCount > 0 { add(.graphic, .faces, -30) }
         if photoLabel != nil { add(.graphic, .photographicLabels, -20) }
-        if input.device != nil { add(.graphic, .cameraMetadata, -25) }
+        if cameraMetadata { add(.graphic, .cameraMetadata, -25) }
         if input.ocrChars >= 200 { add(.graphic, .denseText, -10) }
         if deviceSize { add(.graphic, .deviceDimensions, -25) }
 

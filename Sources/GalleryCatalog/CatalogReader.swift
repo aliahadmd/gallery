@@ -183,6 +183,41 @@ public actor CatalogReader {
         return try handle.query(sql, arguments).map(CatalogRow.item)
     }
 
+    /// The reverse of `liveCompanions`: companion id → still id. Selecting only the video half has to pull
+    /// the still into the same rename, or the pair stops being a pair on the next walk.
+    public func liveStills(of ids: [MediaID]) throws -> [MediaID: MediaID] {
+        guard !ids.isEmpty else { return [:] }
+        var result: [MediaID: MediaID] = [:]
+        var index = 0
+        while index < ids.count {
+            let chunk = Array(ids[index..<min(index + 500, ids.count)])
+            let rows = try items(ids: chunk)
+            var folders: [String: [MediaItem]] = [:]
+            for row in rows where row.subtype.contains(.livePhotoCompanion) {
+                folders["\(row.sourceID.rawValue)|\(row.parentDirectory)", default: []].append(row)
+            }
+            for (_, companions) in folders {
+                guard let first = companions.first else { continue }
+                let siblings = try handle.query(
+                    """
+                    SELECT \(CatalogRow.itemSelectList) \(CatalogRow.itemFrom)
+                    WHERE media.src_id = ? AND media.parent_rel = ? AND (media.subtype & ?) <> 0
+                    """,
+                    [.integer(first.sourceID.rawValue), .text(first.parentDirectory),
+                     .integer(Int64(MediaSubtype.livePhoto.rawValue))]
+                ).map(CatalogRow.item)
+                for companion in companions {
+                    let stem = Self.foldedStem(companion.name)
+                    if let still = siblings.first(where: { Self.foldedStem($0.name) == stem }) {
+                        result[companion.id] = still.id
+                    }
+                }
+            }
+            index += chunk.count
+        }
+        return result
+    }
+
     /// Which of these ids still belong to the album. Pruning an explicit selection against the album, rather
     /// than against the loaded page, is what keeps a reload from silently dropping off-page selections.
     public func ids(in album: AlbumKind, among ids: [MediaID]) throws -> Set<MediaID> {
@@ -265,6 +300,104 @@ public actor CatalogReader {
             )
         }
         return result
+    }
+
+    /// One classified row with everything a human reviewer needs to judge it: what the catalog shows, what
+    /// the classifier recorded, and the user's feedback if any. This is the export the category plan's
+    /// accuracy audit needs; it is a report, not a second source of truth.
+    public struct CategoryAuditRow: Sendable, Hashable {
+        public var mediaID: MediaID
+        public var relativePath: String
+        public var name: String
+        public var storedCategory: MediaCategory
+        public var storedConfidence: Double
+        public var feedbackCategory: MediaCategory?
+        public var feedbackVerdict: Int?
+        public var evidence: CategoryEvidence?
+        public var sampledSide: Int?
+        public var version: Int?
+        public var revision: String?
+
+        public init(
+            mediaID: MediaID, relativePath: String, name: String,
+            storedCategory: MediaCategory, storedConfidence: Double,
+            feedbackCategory: MediaCategory? = nil, feedbackVerdict: Int? = nil,
+            evidence: CategoryEvidence? = nil, sampledSide: Int? = nil,
+            version: Int? = nil, revision: String? = nil
+        ) {
+            self.mediaID = mediaID
+            self.relativePath = relativePath
+            self.name = name
+            self.storedCategory = storedCategory
+            self.storedConfidence = storedConfidence
+            self.feedbackCategory = feedbackCategory
+            self.feedbackVerdict = feedbackVerdict
+            self.evidence = evidence
+            self.sampledSide = sampledSide
+            self.version = version
+            self.revision = revision
+        }
+
+        /// What the shelves actually show, feedback folded in exactly as the album query folds it.
+        public var effectiveCategory: MediaCategory {
+            guard let verdict = feedbackVerdict, let category = feedbackCategory else {
+                return storedCategory
+            }
+            if verdict > 0 { return category }
+            if verdict < 0 { return MediaCategory.none }
+            return storedCategory
+        }
+    }
+
+    public func categoryAuditRows(limit: Int = 100_000) throws -> [CategoryAuditRow] {
+        try handle.query(
+            """
+            SELECT media.id, media.rel_path, media.name, media.category, media.category_confidence,
+                   cf.category AS feedback_category, cf.verdict AS feedback_verdict,
+                   mc.version, mc.revision, mc.category AS evidence_category, mc.confidence,
+                   mc.score, mc.reasons_json, mc.sampled_side
+            FROM media
+            LEFT JOIN media_category AS mc ON mc.media_id = media.id
+            LEFT JOIN category_feedback AS cf ON cf.media_id = media.id
+            WHERE media.trash = 0 AND media.kind = 0 AND media.category_stage = 2
+            ORDER BY media.category, media.category_confidence DESC, media.id
+            LIMIT ?
+            """,
+            [.integer(Int64(limit))]
+        ).map { row in
+            let reasonsJSON = try row.optionalString(named: "reasons_json")
+            let reasons = reasonsJSON.flatMap { text in
+                try? JSONDecoder().decode([CategoryReason].self, from: Data(text.utf8))
+            } ?? []
+            let evidenceCategory = MediaCategory(rawValue: Int16(truncatingIfNeeded:
+                try row.int64(named: "evidence_category"))) ?? .none
+            let evidence = try row.optionalInt64(named: "version").map { _ in
+                CategoryEvidence(
+                    category: evidenceCategory,
+                    confidence: try row.double(named: "confidence"),
+                    score: try row.double(named: "score"),
+                    reasons: reasons,
+                    version: Int(try row.int64(named: "version")),
+                    revision: try row.string(named: "revision")
+                )
+            }
+            return CategoryAuditRow(
+                mediaID: MediaID(rawValue: try row.int64(named: "id")),
+                relativePath: try row.string(named: "rel_path"),
+                name: try row.string(named: "name"),
+                storedCategory: MediaCategory(rawValue: Int16(truncatingIfNeeded:
+                    try row.int64(named: "category"))) ?? .none,
+                storedConfidence: try row.double(named: "category_confidence"),
+                feedbackCategory: try row.optionalInt64(named: "feedback_category").map {
+                    MediaCategory(rawValue: Int16(truncatingIfNeeded: $0)) ?? .none
+                },
+                feedbackVerdict: try row.optionalInt64(named: "feedback_verdict").map(Int.init),
+                evidence: evidence,
+                sampledSide: try row.optionalInt64(named: "sampled_side").map(Int.init),
+                version: try row.optionalInt64(named: "version").map(Int.init),
+                revision: try row.optionalString(named: "revision")
+            )
+        }
     }
 
     /// The perceptual hash the analysis pass stored for a still.

@@ -22,6 +22,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/Gallery" "$APP/Contents/MacOS/Gallery"
 chmod +x "$APP/Contents/MacOS/Gallery"
 cp "$ROOT/App/Info.plist" "$APP/Contents/Info.plist"
+# The Finder service's port name is the app's own name. Keeping it as a literal would silently break the
+# service the day the bundle is renamed, so the build fills it in from CFBundleName.
+APP_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$APP/Contents/Info.plist")"
+/usr/libexec/PlistBuddy -c "Set :NSServices:0:NSPortName $APP_NAME" "$APP/Contents/Info.plist"
 cp "$ROOT/App/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
