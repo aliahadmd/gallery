@@ -2,14 +2,17 @@ Gallery — install
 
 1. Double-click the zip to unpack it.
 2. Drag "Gallery.app" into /Applications (or any folder where you keep apps).
-3. First launch: right-click Gallery.app and choose Open, then Open again.
-   Gallery is signed with a free local development certificate, not notarized by
-   Apple, so macOS asks for confirmation once. That is expected and is the only
-   extra step.
+3. Turn it on in Settings first. Gallery is signed locally, not notarized by
+   Apple, so macOS blocks the first launch. Open System Settings > Privacy &
+   Security, scroll down to Security, and click "Open Anyway" next to Gallery
+   (if the button is not there yet, try to open Gallery once and macOS will
+   offer it). Authenticate with Touch ID or your password. Until this switch is
+   turned on the app will not launch. Then open Gallery again and confirm Open.
+   This is a one-time step.
 4. If macOS instead says the app is "damaged" (rare; some unzip tools re-pack the
    bundle), open Terminal and run:
        xattr -dr com.apple.quarantine /Applications/Gallery.app
-   Then open it normally.
+   Then repeat step 3.
 5. Gallery reads your folders in place and uploads nothing. Add a folder with ⌘O.
 
 Finder

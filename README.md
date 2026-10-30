@@ -24,10 +24,15 @@ have.
 
 1. Download `Gallery-<version>.zip` from the [latest release](../../releases/latest).
 2. Unzip and drag **Gallery.app** into `/Applications`.
-3. The app is signed locally, not notarised. The first launch needs **right-click → Open** (or
-   System Settings → Privacy & Security → Open Anyway). If the zip was downloaded by a browser that
-   quarantines it, `xattr -dr com.apple.quarantine /Applications/Gallery.app` clears the flag.
-4. Add folders with **⌘O** or by dragging them onto the window. Finder also offers
+3. **Turn it on in Settings first.** Gallery is signed locally, not notarised by Apple, so macOS blocks
+   the first launch. Open **System Settings → Privacy & Security**, scroll down to **Security**, and click
+   **Open Anyway** next to Gallery (if the button is not there yet, try to open Gallery once and macOS
+   will offer it). Authenticate with Touch ID or your password. Until this switch is turned on, the app
+   will not launch. Then open Gallery again and confirm **Open**.
+4. If macOS instead says the app is "damaged" (some unzip tools re-pack the bundle), clear the quarantine
+   flag in Terminal and repeat step 3:
+   `xattr -dr com.apple.quarantine /Applications/Gallery.app`
+5. Add folders with **⌘O** or by dragging them onto the window. Finder also offers
    **Services ▸ Open Folder in Gallery** and **Open With ▸ Gallery** for folders.
 
 After installing a new version, macOS may ask for folder access again: the sandbox ties a folder grant to
